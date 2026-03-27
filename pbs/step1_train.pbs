@@ -1,0 +1,39 @@
+#!/bin/bash
+#PBS -N free_arr_train
+#PBS -q par16
+#PBS -l nodes=1:ppn=16
+#PBS -l walltime=240:00:00
+#PBS -e logs/train.err
+#PBS -o logs/train.out
+
+cd $PBS_O_WORKDIR
+echo "Job starting:" `date`
+mkdir -p logs
+
+module load python/3.8.11-intel-2021.3.0
+source free_arr/bin/activate
+export OMP_NUM_THREADS=16
+
+# Step 1: Curriculum training n=6 -> 20
+# Trains PPO with adaptive curriculum, singularity-aware candidate generation,
+# and smooth Saito loss for n > 12.
+python main.py train \
+  --n-min 6 \
+  --n-max 20 \
+  --coord-range 5 \
+  --total-steps 5000000 \
+  --n-steps 2048 \
+  --batch-size 128 \
+  --lr 3e-4 \
+  --ent-coef 0.02 \
+  --singularity-aware \
+  --max-candidates 200 \
+  --skip-exact-above 12 \
+  --w-free 10.0 \
+  --w-alg 0.5 \
+  --w-comb 0.3 \
+  --save model_n20.pt \
+  --save-every 50 \
+  --log-every 5
+
+echo "Job completed:" `date`
