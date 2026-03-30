@@ -5,6 +5,7 @@
 #PBS -l walltime=48:00:00
 #PBS -e logs/explore.err
 #PBS -o logs/explore.out
+#PBS -m abe
 
 cd $PBS_O_WORKDIR
 echo "Job starting:" `date`

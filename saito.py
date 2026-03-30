@@ -419,12 +419,17 @@ def _als_minimize(T, q, n_iters=10, n_restarts=3, rng=None):
     return best_loss, best_a2, best_a3
 
 
-def smooth_saito_loss(arr):
+def smooth_saito_loss(arr, target_exponents=None):
     """Compute smooth Saito loss for a line arrangement.
 
     Searches over the full null spaces ker(M_d2), ker(M_d3) to find
     derivations theta2, theta3 minimizing:
         ||det(Euler, theta2, theta3) - c*Q||^2 / ||Q||^2
+
+    Args:
+        arr: LineArrangement
+        target_exponents: optional (d2, d3) tuple. If provided, use these
+            exponents instead of deriving from the arrangement's b2.
 
     Returns:
         loss: float in [0, 1], where 0 = free arrangement, 1 = far from free
@@ -433,11 +438,13 @@ def smooth_saito_loss(arr):
     if n < 3:
         return 1.0
 
-    exps = arr.candidate_exponents()
-    if exps is None:
-        return 1.0
-
-    d2, d3 = exps
+    if target_exponents is not None:
+        d2, d3 = target_exponents
+    else:
+        exps = arr.candidate_exponents()
+        if exps is None:
+            return 1.0
+        d2, d3 = exps
 
     # Build float derivation matrices
     M_d2 = _float_derivation_matrix(arr, d2)
@@ -470,15 +477,20 @@ def smooth_saito_loss(arr):
     return float(np.clip(loss, 0.0, 1.0))
 
 
-def algebraic_score(arr: LineArrangement) -> float:
+def algebraic_score(arr: LineArrangement, target_exponents=None) -> float:
     """
     Continuous score in [-1, 1] measuring progress toward freeness.
 
     Two-tier design:
       Tier 1 ([-1, 0]): discriminant proximity — how close is b2 to producing
-        integer exponents?  Cheap arithmetic, always computable.
+        the target exponents?  Cheap arithmetic, always computable.
       Tier 2 ([0, 1]): smooth Saito loss — searches over full null spaces via
         ALS to find optimal derivations minimizing ||det - c*Q||/||Q||.
+
+    Args:
+        arr: LineArrangement
+        target_exponents: optional (d2, d3) tuple. If provided, Tier 1 measures
+            distance from current b2 to target_b2 = (n-1) + d2*d3.
 
     Score landscape:
       [-1.0]       product < 0 (b2 too small for any exponents)
@@ -491,33 +503,52 @@ def algebraic_score(arr: LineArrangement) -> float:
         return -1.0
 
     b2 = arr.b2()
-    product = b2 - (n - 1)       # = d2 * d3
-    disc = (n - 1) ** 2 - 4 * product
 
-    # ── Tier 1: discriminant proximity → [-1, 0] ────────────────────────────
+    if target_exponents is not None:
+        d2_t, d3_t = target_exponents
+        target_n = d2_t + d3_t + 1
+        target_b2 = (target_n - 1) + d2_t * d3_t
+        # Tier 1: distance from b2 to target_b2 (scaled by target_n)
+        max_b2 = max(1, target_n * (target_n - 1) // 2)
+        distance = abs(b2 - target_b2) / max_b2
+        if distance > 0.5:
+            return -1.0
+        if distance > 0:
+            return -distance * 2  # in [-1, 0)
+        # b2 matches target — Tier 2 only when arrangement is at target size
+        if n == target_n:
+            loss = smooth_saito_loss(arr, target_exponents=target_exponents)
+            return 1.0 - loss
+        else:
+            return 0.0  # b2 is on track but arrangement still growing
+    else:
+        product = b2 - (n - 1)       # = d2 * d3
+        disc = (n - 1) ** 2 - 4 * product
 
-    if product < 0:
-        return -1.0
+        # ── Tier 1: discriminant proximity → [-1, 0] ────────────────────────
 
-    if disc < 0:
-        proximity = max(0.0, 1.0 - abs(disc) / max(1, (n - 1) ** 2))
-        return -1.0 + proximity * 0.5  # in [-1.0, -0.5]
+        if product < 0:
+            return -1.0
 
-    sqrt_disc = disc ** 0.5
-    nearest_int = round(sqrt_disc)
+        if disc < 0:
+            proximity = max(0.0, 1.0 - abs(disc) / max(1, (n - 1) ** 2))
+            return -1.0 + proximity * 0.5  # in [-1.0, -0.5]
 
-    if int(nearest_int) * int(nearest_int) != disc:
-        frac = abs(sqrt_disc - nearest_int)  # in (0, 0.5]
-        return -frac  # in [-0.5, 0)
+        sqrt_disc = disc ** 0.5
+        nearest_int = round(sqrt_disc)
 
-    sq = int(nearest_int)
-    if (n - 1 - sq) % 2 != 0 or (n - 1 - sq) < 0:
-        return -0.01
+        if int(nearest_int) * int(nearest_int) != disc:
+            frac = abs(sqrt_disc - nearest_int)  # in (0, 0.5]
+            return -frac  # in [-0.5, 0)
 
-    # ── Tier 2: smooth Saito loss → [0, 1] ──────────────────────────────────
+        sq = int(nearest_int)
+        if (n - 1 - sq) % 2 != 0 or (n - 1 - sq) < 0:
+            return -0.01
 
-    loss = smooth_saito_loss(arr)
-    return 1.0 - loss  # 0 = far from free, 1 = exactly free
+        # ── Tier 2: smooth Saito loss → [0, 1] ──────────────────────────────
+
+        loss = smooth_saito_loss(arr)
+        return 1.0 - loss  # 0 = far from free, 1 = exactly free
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -617,6 +648,17 @@ def multiplicity_penalty(arr: LineArrangement, target_n: int) -> float:
     return -(max_mult - threshold) / max(1, target_n - threshold)
 
 
+def b2_trajectory_bonus(arr: LineArrangement, target_b2: int, target_n: int) -> float:
+    """Reward for b2 moving toward target_b2. Returns float in [0, 1]."""
+    n = len(arr)
+    if n < 2:
+        return 0.0
+    b2 = arr.b2()
+    max_b2 = max(1, target_n * (target_n - 1) // 2)
+    distance = abs(b2 - target_b2) / max_b2
+    return max(0.0, 1.0 - distance)
+
+
 def saito_reward(
     arr: LineArrangement,
     target_n: int,
@@ -629,8 +671,10 @@ def saito_reward(
     w_interest: float = 1.0,
     w_feasibility: float = 0.5,
     w_mult_growth: float = 0.3,
+    w_b2_traj: float = 0.5,
     terminal_only_free_bonus: bool = True,
     skip_exact_above: int = 12,
+    target_exponents=None,
 ) -> float:
     """
     Compute shaped reward for the RL agent.
@@ -647,9 +691,11 @@ def saito_reward(
         w_interest: Weight for interestingness bonus (combinatorial richness).
         w_feasibility: Bonus when candidate exponents become feasible.
         w_mult_growth: Bonus when a point's multiplicity grows to 3+.
+        w_b2_traj: Weight for b2 trajectory bonus toward target exponents.
         terminal_only_free_bonus: Only give w_free at terminal step (len==target_n).
         skip_exact_above: Skip costly sympy exact check for n > this value during training.
                           Instead give a partial bonus based on algebraic score.
+        target_exponents: optional (d2, d3) tuple for exponent-targeted training.
 
     Returns:
         float reward
@@ -670,7 +716,7 @@ def saito_reward(
     # Algebraic score
     n = len(arr)
     if n >= 3:
-        reward += w_alg * algebraic_score(arr)
+        reward += w_alg * algebraic_score(arr, target_exponents=target_exponents)
 
     # Interestingness bonus (rich singularity structure)
     if n >= 3:
@@ -682,6 +728,12 @@ def saito_reward(
         has_cand = arr.candidate_exponents() is not None
         if has_cand:
             reward += w_feasibility
+
+        # b2 trajectory bonus: guide toward target b2
+        if target_exponents is not None:
+            d2_t, d3_t = target_exponents
+            target_b2 = (target_n - 1) + d2_t * d3_t
+            reward += w_b2_traj * b2_trajectory_bonus(arr, target_b2, target_n)
 
         # Multiplicity growth: reward creating new triple+ points
         if prev_arr is not None and len(prev_arr) >= 2:
@@ -703,7 +755,7 @@ def saito_reward(
                     reward += w_free
             else:
                 # Large n: give stronger partial bonus based on algebraic score
-                alg = algebraic_score(arr)
+                alg = algebraic_score(arr, target_exponents=target_exponents)
                 if alg > 0.95:
                     reward += w_free * 0.8 * ((alg - 0.95) / 0.05)
                 elif alg > 0.80:

@@ -135,13 +135,14 @@ def _score_line_against_structure(line, arr):
 # Feature extraction (scalar features)
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCALAR_DIM = 14   # expanded from 11
+SCALAR_DIM = 17   # 14 base + 3 exponent-targeting features
 
-def extract_scalars(arr: LineArrangement, target_n: int) -> np.ndarray:
+def extract_scalars(arr: LineArrangement, target_n: int,
+                    target_exponents=None) -> np.ndarray:
     """
     Build scalar feature vector for the policy network.
 
-    Original 11 features + 3 new singularity-aware features:
+    Original 11 features + 3 singularity-aware + 3 exponent-targeting:
       [0]  n / target_n
       [1]  b2 / (n*(n-1)/2 + 1)
       [2]  disc_norm (tanh-scaled discriminant)
@@ -153,10 +154,13 @@ def extract_scalars(arr: LineArrangement, target_n: int) -> np.ndarray:
       [8]  algebraic_score
       [9]  max_mult / target_n
       [10] n_pts / (n*(n-1)/2)
-      --- new ---
       [11] n_triple_plus / n  (fraction of points with mult >= 3)
       [12] mult_entropy  (entropy of multiplicity distribution, normalized)
       [13] singularity_density = sum(C(m,2)) / C(n,2)
+      --- exponent targeting ---
+      [14] d2_norm = target_d2 / (target_n - 1)
+      [15] d3_norm = target_d3 / (target_n - 1)
+      [16] b2_progress = 1 - |b2 - target_b2| / max_b2
     """
     n = len(arr)
     if n < 2:
@@ -200,6 +204,19 @@ def extract_scalars(arr: LineArrangement, target_n: int) -> np.ndarray:
         norm_entropy = 0.0
         sing_density = 0.0
 
+    # Exponent-targeting features
+    if target_exponents is not None:
+        d2_t, d3_t = target_exponents
+        d2_norm = d2_t / max(1, target_n - 1)
+        d3_norm = d3_t / max(1, target_n - 1)
+        target_b2 = (target_n - 1) + d2_t * d3_t
+        max_b2 = max(1, target_n * (target_n - 1) // 2)
+        b2_progress = max(0.0, 1.0 - abs(b2 - target_b2) / max_b2) if n >= 2 else 0.0
+    else:
+        d2_norm = 0.0
+        d3_norm = 0.0
+        b2_progress = 0.0
+
     return np.array([
         n / target_n,
         b2 / max(1, n * (n - 1) / 2),
@@ -209,13 +226,17 @@ def extract_scalars(arr: LineArrangement, target_n: int) -> np.ndarray:
         m4p / max(1, n),
         float(arr.is_pencil()),
         combinatorial_score(arr),
-        algebraic_score(arr) if n >= 3 else 0.0,
+        algebraic_score(arr, target_exponents=target_exponents) if n >= 3 else 0.0,
         max_mult / max(1, target_n),
         n_pts / max(1, n * (n - 1) / 2),
-        # new
+        # singularity-aware
         triple_ratio,
         norm_entropy,
         sing_density,
+        # exponent-targeting
+        d2_norm,
+        d3_norm,
+        b2_progress,
     ], dtype=np.float32)
 
 
@@ -269,6 +290,7 @@ class FreeArrangementEnv:
         self.w_mult = w_mult
         self.w_interest = w_interest
         self.skip_exact_above = skip_exact_above
+        self.target_exponents = None  # (d2, d3) or None
 
         # Static pool (always available for bootstrap / diversity)
         self.pool = generate_candidate_lines(coord_range)
@@ -286,9 +308,11 @@ class FreeArrangementEnv:
 
     # ── Reset ─────────────────────────────────────────────────────────────────
 
-    def reset(self, target_n: int = None, random_start: bool = False):
+    def reset(self, target_n: int = None, random_start: bool = False,
+              target_exponents=None):
         if target_n is not None:
             self.target_n = target_n
+        self.target_exponents = target_exponents
         self.arr = LineArrangement()
         self.selected_pool = np.zeros(self.pool_size, dtype=bool)
         self.step_count = 0
@@ -407,7 +431,8 @@ class FreeArrangementEnv:
         for i, line in enumerate(self.arr.lines):
             sel[i] = line.to_float()
 
-        scalars = extract_scalars(self.arr, self.target_n)
+        scalars = extract_scalars(self.arr, self.target_n,
+                                  target_exponents=self.target_exponents)
 
         return {
             'selected_coords': sel,
@@ -461,6 +486,7 @@ class FreeArrangementEnv:
             w_interest=self.w_interest,
             terminal_only_free_bonus=True,
             skip_exact_above=self.skip_exact_above,
+            target_exponents=self.target_exponents,
         )
 
         info = {
@@ -469,6 +495,7 @@ class FreeArrangementEnv:
             'is_pencil': is_pencil,
             'is_terminal': is_terminal,
             'candidate_exponents': self.arr.candidate_exponents(),
+            'target_exponents': self.target_exponents,
         }
 
         if is_terminal and not is_pencil:

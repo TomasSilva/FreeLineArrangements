@@ -68,6 +68,7 @@ def log_discovery(
     mult_profile=None,
     n_pts=None,
     source=None,
+    target_exponents=None,
     path=DEFAULT_PATH,
 ):
     """
@@ -105,6 +106,7 @@ def log_discovery(
         "n_pts": n_pts,
         "lines": lines_str,
         "source": source,
+        "target_exponents": list(target_exponents) if target_exponents else None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

@@ -110,7 +110,7 @@ def _load_model(model_path, n_max, args):
         d_model=getattr(args, 'd_model', 128),
         n_heads=getattr(args, 'n_heads', 4),
         n_layers=getattr(args, 'n_layers', 3),
-        scalar_dim=14,
+        scalar_dim=17,
     )
     if model_path and model_path != '':
         ckpt = torch.load(model_path, map_location='cpu')
@@ -134,7 +134,12 @@ def run_explore(args):
     )
     model = _load_model(args.model, n_max, args)
 
-    print(f"\nExploring {args.episodes} episodes for n={args.n}...")
+    target_exponents = tuple(args.target_exponents) if getattr(args, 'target_exponents', None) else None
+    if target_exponents:
+        print(f"\nExploring {args.episodes} episodes for n={args.n}, target exponents={target_exponents}...")
+        env.target_exponents = target_exponents
+    else:
+        print(f"\nExploring {args.episodes} episodes for n={args.n}...")
     found = evaluate_greedy(model, env, n_episodes=args.episodes, target_n=args.n)
 
     # Deduplicate by exponents + b2
@@ -341,6 +346,9 @@ def main():
     exp_parser.add_argument('--singularity-aware', action='store_true',
                             help='Use singularity-driven candidate generation')
     exp_parser.add_argument('--max-candidates', type=int, default=200)
+    exp_parser.add_argument('--target-exponents', type=int, nargs=2, default=None,
+                            metavar=('D2', 'D3'),
+                            help='Target exponent pair (d2 d3) for exploration')
 
     # verify-found (post-hoc exact check for large n)
     vf_parser = subparsers.add_parser('verify-found')
@@ -355,6 +363,9 @@ def main():
     vf_parser.add_argument('--singularity-aware', action='store_true',
                             help='Use singularity-driven candidate generation')
     vf_parser.add_argument('--max-candidates', type=int, default=200)
+    vf_parser.add_argument('--target-exponents', type=int, nargs=2, default=None,
+                            metavar=('D2', 'D3'),
+                            help='Target exponent pair (d2 d3) for verification')
 
     # discoveries
     subparsers.add_parser('discoveries', help='Show summary of saved discoveries')

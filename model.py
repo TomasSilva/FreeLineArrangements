@@ -62,7 +62,7 @@ class TransformerActorCritic(nn.Module):
         d_model: int = 128,
         n_heads: int = 4,
         n_layers: int = 3,
-        scalar_dim: int = 14,
+        scalar_dim: int = 17,
     ):
         super().__init__()
         self.max_n = max_n
@@ -192,6 +192,34 @@ class TransformerActorCritic(nn.Module):
         action = logits.argmax(dim=-1) if deterministic else dist.sample()
         log_prob = dist.log_prob(action)
         return action.item(), log_prob.squeeze(0), value.squeeze(0)
+
+    @torch.no_grad()
+    def act_batch(self, obs_list, deterministic=False):
+        """
+        Batched inference over multiple observations.
+
+        Args:
+            obs_list: list of obs dicts from FreeArrangementEnv._obs()
+            deterministic: if True, take argmax
+
+        Returns:
+            actions   : list of int
+            log_probs : tensor (B,)
+            values    : tensor (B,)
+        """
+        import numpy as np
+        sel = torch.FloatTensor(np.stack([o['selected_coords'] for o in obs_list]))
+        cand = torch.FloatTensor(np.stack([o['candidate_coords'] for o in obs_list]))
+        sc = torch.FloatTensor(np.stack([o['scalars'] for o in obs_list]))
+        mask = torch.FloatTensor(np.stack([o['mask'] for o in obs_list]))
+        n_sel = torch.tensor([o['n_selected'] for o in obs_list], dtype=torch.long)
+
+        logits, values = self.forward(sel, cand, sc, mask, n_sel)
+        dist = torch.distributions.Categorical(logits=logits)
+
+        actions = logits.argmax(dim=-1) if deterministic else dist.sample()
+        log_probs = dist.log_prob(actions)
+        return actions.tolist(), log_probs, values
 
     def evaluate(self, batch_obs: dict, actions: torch.Tensor, masks: torch.Tensor):
         """

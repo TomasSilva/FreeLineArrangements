@@ -5,6 +5,7 @@
 #PBS -l walltime=240:00:00
 #PBS -e logs/train.err
 #PBS -o logs/train.out
+#PBS -m abe
 
 cd $PBS_O_WORKDIR
 echo "Job starting:" `date`
@@ -12,17 +13,19 @@ mkdir -p logs
 
 module load python/3.8.11-intel-2021.3.0
 source free_arr/bin/activate
-export OMP_NUM_THREADS=16
+export OMP_NUM_THREADS=1   # each worker manages its own thread; 16 workers = 16 cores
 
 # Step 1: Curriculum training n=6 -> 20
 # Trains PPO with adaptive curriculum, singularity-aware candidate generation,
-# and smooth Saito loss for n > 12.
+# smooth Saito loss for n > 12, and exponent-targeted triple curriculum.
+# Uses 16 parallel environments (one per core).
 python main.py train \
   --n-min 6 \
   --n-max 20 \
   --coord-range 5 \
   --total-steps 5000000 \
-  --n-steps 2048 \
+  --n-envs 16 \
+  --n-steps 128 \
   --batch-size 128 \
   --lr 3e-4 \
   --ent-coef 0.02 \

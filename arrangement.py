@@ -167,6 +167,11 @@ class LineArrangement:
 
     # ── Exponent candidates ───────────────────────────────────────────────────
 
+    @staticmethod
+    def all_exponent_types(n):
+        """All valid (d2, d3) with 1 <= d2 <= d3 and d2+d3 = n-1."""
+        return [(d2, n - 1 - d2) for d2 in range(1, (n - 1) // 2 + 1)]
+
     def candidate_exponents(self):
         """
         Necessary condition for freeness with exponents (1, d2, d3):
@@ -374,3 +379,9 @@ class LineArrangement:
             'is_pencil': pencil,
             'multiplicity_profile': mults,
         }
+
+
+# Module-level convenience alias
+def all_exponent_types(n):
+    """All valid (d2, d3) with 1 <= d2 <= d3 and d2+d3 = n-1."""
+    return LineArrangement.all_exponent_types(n)
