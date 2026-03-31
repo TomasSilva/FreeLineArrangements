@@ -13,20 +13,29 @@ mkdir -p logs
 
 module load python/3.8.11-intel-2021.3.0
 source free_arr/bin/activate
-export OMP_NUM_THREADS=16
+export OMP_NUM_THREADS=1   # one core per explore process
+export PYTHONUNBUFFERED=1   # flush print output immediately for real-time monitoring
 
-# Step 2: Greedy exploration from trained model
-# Runs the trained policy to collect free arrangements for each target n.
+# Step 2: Parallel exponent-targeted exploration
+# For each n, explore all valid (d2, d3) pairs in parallel (up to 16 at a time).
+# Each job targets a specific exponent type so the agent searches for hard types too.
+# Monitor with: tail -f logs/explore_*.log
+
+JOBS_FILE=$(mktemp)
+
 for N in 10 12 14 15 16 17 18 19 20; do
-  echo "========== Exploring n=$N =========="
-  python main.py explore \
-    --n $N \
-    --n-max 20 \
-    --model model_n20.pt \
-    --coord-range 5 \
-    --episodes 5000 \
-    --singularity-aware \
-    --max-candidates 200
+  MAX_D2=$(( (N - 1) / 2 ))
+  for D2 in $(seq 1 $MAX_D2); do
+    D3=$(( N - 1 - D2 ))
+    echo "python main.py explore --n $N --n-max 20 --model model_n20.pt --coord-range 5 --episodes 5000 --singularity-aware --max-candidates 200 --target-exponents $D2 $D3 2>&1 | tee logs/explore_n${N}_d${D2}_${D3}.log" >> "$JOBS_FILE"
+  done
 done
 
+echo "Total explore jobs: $(wc -l < "$JOBS_FILE")"
+cat "$JOBS_FILE"
+
+# Run up to 16 jobs in parallel
+xargs -P 16 -I {} bash -c '{}' < "$JOBS_FILE"
+
+rm -f "$JOBS_FILE"
 echo "Job completed:" `date`

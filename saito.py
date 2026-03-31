@@ -508,19 +508,21 @@ def algebraic_score(arr: LineArrangement, target_exponents=None) -> float:
         d2_t, d3_t = target_exponents
         target_n = d2_t + d3_t + 1
         target_b2 = (target_n - 1) + d2_t * d3_t
-        # Tier 1: distance from b2 to target_b2 (scaled by target_n)
-        max_b2 = max(1, target_n * (target_n - 1) // 2)
-        distance = abs(b2 - target_b2) / max_b2
-        if distance > 0.5:
+        # Tier 1: distance from b2 to target_b2
+        # Scale by target_b2 itself (not max_b2) for sharper signal on high-b2 targets
+        scale = max(1, target_b2)
+        distance = abs(b2 - target_b2) / scale
+        if distance > 1.0:
             return -1.0
         if distance > 0:
-            return -distance * 2  # in [-1, 0)
+            return -distance  # in [-1, 0)
         # b2 matches target — Tier 2 only when arrangement is at target size
         if n == target_n:
             loss = smooth_saito_loss(arr, target_exponents=target_exponents)
             return 1.0 - loss
         else:
-            return 0.0  # b2 is on track but arrangement still growing
+            # Dense positive signal during growth: reward progress toward target size
+            return 0.3 * (n / target_n)  # in (0, 0.3) — grows as arrangement builds
     else:
         product = b2 - (n - 1)       # = d2 * d3
         disc = (n - 1) ** 2 - 4 * product
@@ -649,13 +651,19 @@ def multiplicity_penalty(arr: LineArrangement, target_n: int) -> float:
 
 
 def b2_trajectory_bonus(arr: LineArrangement, target_b2: int, target_n: int) -> float:
-    """Reward for b2 moving toward target_b2. Returns float in [0, 1]."""
+    """Reward for b2 moving toward target_b2. Returns float in [0, 1].
+
+    Scales distance relative to target_b2 itself (not max_b2), so high-b2
+    targets get sharper gradient signal.
+    """
     n = len(arr)
     if n < 2:
         return 0.0
     b2 = arr.b2()
-    max_b2 = max(1, target_n * (target_n - 1) // 2)
-    distance = abs(b2 - target_b2) / max_b2
+    # Scale by target_b2, not max_b2 — being 10 off from b2=100 is
+    # much more on-track than 10 off from b2=20
+    scale = max(1, target_b2)
+    distance = abs(b2 - target_b2) / scale
     return max(0.0, 1.0 - distance)
 
 
@@ -671,7 +679,7 @@ def saito_reward(
     w_interest: float = 1.0,
     w_feasibility: float = 0.5,
     w_mult_growth: float = 0.3,
-    w_b2_traj: float = 0.5,
+    w_b2_traj: float = 1.5,
     terminal_only_free_bonus: bool = True,
     skip_exact_above: int = 12,
     target_exponents=None,

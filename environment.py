@@ -210,8 +210,8 @@ def extract_scalars(arr: LineArrangement, target_n: int,
         d2_norm = d2_t / max(1, target_n - 1)
         d3_norm = d3_t / max(1, target_n - 1)
         target_b2 = (target_n - 1) + d2_t * d3_t
-        max_b2 = max(1, target_n * (target_n - 1) // 2)
-        b2_progress = max(0.0, 1.0 - abs(b2 - target_b2) / max_b2) if n >= 2 else 0.0
+        scale = max(1, target_b2)
+        b2_progress = max(0.0, 1.0 - abs(b2 - target_b2) / scale) if n >= 2 else 0.0
     else:
         d2_norm = 0.0
         d3_norm = 0.0

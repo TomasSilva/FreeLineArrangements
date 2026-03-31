@@ -14,11 +14,13 @@ mkdir -p logs
 module load python/3.8.11-intel-2021.3.0
 source free_arr/bin/activate
 export OMP_NUM_THREADS=1   # each worker manages its own thread; 16 workers = 16 cores
+export PYTHONUNBUFFERED=1   # flush print output immediately for real-time monitoring
 
 # Step 1: Curriculum training n=6 -> 20
 # Trains PPO with adaptive curriculum, singularity-aware candidate generation,
 # smooth Saito loss for n > 12, and exponent-targeted triple curriculum.
 # Uses 16 parallel environments (one per core).
+# Monitor with: tail -f logs/train.log
 python main.py train \
   --n-min 6 \
   --n-max 20 \
@@ -37,6 +39,7 @@ python main.py train \
   --w-comb 0.3 \
   --save model_n20.pt \
   --save-every 50 \
-  --log-every 5
+  --log-every 5 \
+  2>&1 | tee logs/train.log
 
 echo "Job completed:" `date`

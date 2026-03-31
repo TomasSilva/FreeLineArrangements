@@ -224,6 +224,7 @@ def _sample_curriculum_triple(triples, stats, rng, threshold=0.15):
 
     weights = []
     for triple in triples:
+        n, d2, d3 = triple
         s = triple_success.get(triple, 0.0)
         eps = triple_episodes.get(triple, 0)
         w = max(0.05, 1.0 - s)
@@ -233,6 +234,11 @@ def _sample_curriculum_triple(triples, stats, rng, threshold=0.15):
         # Also boost triples that have had very few episodes
         if eps < 10:
             w *= 1.5
+        # Boost high-b2 (hard) exponent types — these need more attempts
+        # b2 = (n-1) + d2*d3; ratio = d2*d3 / max_product where max ~= ((n-1)/2)^2
+        max_product = ((n - 1) / 2) ** 2
+        b2_difficulty = d2 * d3 / max(1, max_product)  # 0 for easy, ~1 for hardest
+        w *= (1.0 + 2.0 * b2_difficulty)  # up to 3x boost for hardest types
         weights.append(w)
 
     weights = np.array(weights)
