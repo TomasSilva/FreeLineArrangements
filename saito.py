@@ -7,9 +7,9 @@ Three levels of signal:
   1. Combinatorial: Does b2(A) give integer candidate exponents?
      disc = (n-1)^2 - 4*(b2-(n-1)) must be >= 0 and a perfect square.
 
-  2. Algebraic (smooth): For candidate exponents (d2, d3), search over the
-     full null spaces ker(M_d2), ker(M_d3) to find derivations theta2, theta3
-     minimizing ||det(Euler, theta2, theta3) - c*Q||^2 / ||Q||^2.
+  2. Algebraic (smooth): For candidate exponents (d1, d2), search over the
+     full null spaces ker(M_d1), ker(M_d2) to find derivations theta1, theta2
+     minimizing ||det(Euler, theta1, theta2) - c*Q||^2 / ||Q||^2.
      Solved via Alternating Least Squares in coefficient space.
 
   3. Algebraic (hard): Does a Saito basis exist?
@@ -39,7 +39,7 @@ def combinatorial_score(arr: LineArrangement) -> float:
     Continuous score in [-1, 1] measuring how close b2(A) is to
     yielding integer candidate exponents.
 
-    The discriminant for candidate exponents (1, d2, d3) is:
+    The discriminant for candidate exponents (1, d1, d2) is:
         disc = (n-1)^2 - 4*(b2 - (n-1))
 
     Score = 1 if disc >= 0 and a perfect square (candidate exponents exist).
@@ -247,40 +247,40 @@ def _null_space_basis(M, tol=1e-10):
     return V, k
 
 
-def _build_det_tensor(V2, V3, d2, d3, n):
+def _build_det_tensor(V2, V3, d1, d2, n):
     """Precompute bilinear tensor T mapping (alpha2, alpha3) -> det coefficients.
 
-    det(Euler, theta2, theta3) = x*(g2*h3 - g3*h2) - y*(f2*h3 - f3*h2) + z*(f2*g3 - f3*g2)
+    det(Euler, theta1, theta2) = x*(g2*h3 - g3*h2) - y*(f2*h3 - f3*h2) + z*(f2*g3 - f3*g2)
 
-    where theta2 = V2 @ alpha2 = (f2, g2, h2) and theta3 = V3 @ alpha3 = (f3, g3, h3).
+    where theta1 = V2 @ alpha2 = (f2, g2, h2) and theta2 = V3 @ alpha3 = (f3, g3, h3).
 
-    Each cross-term is a bilinear product of degree-d2 and degree-d3 polynomials (degree d2+d3=n-1),
+    Each cross-term is a bilinear product of degree-d1 and degree-d2 polynomials (degree d1+d2=n-1),
     then multiplied by x, y, or z to give degree n.
 
     Returns T of shape (N_out, k2, k3) where N_out = C(n+2, 2).
     """
+    _, monoms_d1 = _monomial_index_map(d1)
     _, monoms_d2 = _monomial_index_map(d2)
-    _, monoms_d3 = _monomial_index_map(d3)
     idx_map_out, monoms_out = _monomial_index_map(n)
 
+    N1 = len(monoms_d1)
     N2 = len(monoms_d2)
-    N3 = len(monoms_d3)
     N_out = len(monoms_out)
     k2 = V2.shape[1]
     k3 = V3.shape[1]
 
     # Extract component sub-matrices from V2 and V3
-    # V2 has shape (3*N2, k2): rows [0:N2] = f2, [N2:2*N2] = g2, [2*N2:3*N2] = h2
-    V2_f = V2[:N2]       # (N2, k2)
-    V2_g = V2[N2:2*N2]   # (N2, k2)
-    V2_h = V2[2*N2:]     # (N2, k2)
-    V3_f = V3[:N3]       # (N3, k3)
-    V3_g = V3[N3:2*N3]   # (N3, k3)
-    V3_h = V3[2*N3:]     # (N3, k3)
+    # V2 has shape (3*N1, k2): rows [0:N1] = f2, [N1:2*N1] = g2, [2*N1:3*N1] = h2
+    V2_f = V2[:N1]       # (N1, k2)
+    V2_g = V2[N1:2*N1]   # (N1, k2)
+    V2_h = V2[2*N1:]     # (N1, k2)
+    V3_f = V3[:N2]       # (N2, k3)
+    V3_g = V3[N2:2*N2]   # (N2, k3)
+    V3_h = V3[2*N2:]     # (N2, k3)
 
-    # Precompute the multiplication table for d2 * d3
-    ia, ib, io = _poly_mult_table(d2, d3)
-    _, monoms_nm1 = _monomial_index_map(d2 + d3)  # degree n-1
+    # Precompute the multiplication table for d1 * d2
+    ia, ib, io = _poly_mult_table(d1, d2)
+    _, monoms_nm1 = _monomial_index_map(d1 + d2)  # degree n-1
     N_nm1 = len(monoms_nm1)
 
     # Shift indices for multiplication by x, y, z (degree-1 monomials)
@@ -294,7 +294,7 @@ def _build_det_tensor(V2, V3, d2, d3, n):
 
         Returns shape (N_nm1, ka, kb).
         """
-        # Va: (N_d2, ka), Vb: (N_d3, kb)
+        # Va: (N_d1, ka), Vb: (N_d2, kb)
         ka, kb = Va.shape[1], Vb.shape[1]
         T_term = np.zeros((N_nm1, ka, kb), dtype=np.float64)
         # For each multiplication table entry: out[io[l]] += Va[ia[l]] * Vb[ib[l]]
@@ -422,13 +422,13 @@ def _als_minimize(T, q, n_iters=10, n_restarts=3, rng=None):
 def smooth_saito_loss(arr, target_exponents=None):
     """Compute smooth Saito loss for a line arrangement.
 
-    Searches over the full null spaces ker(M_d2), ker(M_d3) to find
-    derivations theta2, theta3 minimizing:
-        ||det(Euler, theta2, theta3) - c*Q||^2 / ||Q||^2
+    Searches over the full null spaces ker(M_d1), ker(M_d2) to find
+    derivations theta1, theta2 minimizing:
+        ||det(Euler, theta1, theta2) - c*Q||^2 / ||Q||^2
 
     Args:
         arr: LineArrangement
-        target_exponents: optional (d2, d3) tuple. If provided, use these
+        target_exponents: optional (d1, d2) tuple. If provided, use these
             exponents instead of deriving from the arrangement's b2.
 
     Returns:
@@ -439,28 +439,28 @@ def smooth_saito_loss(arr, target_exponents=None):
         return 1.0
 
     if target_exponents is not None:
-        d2, d3 = target_exponents
+        d1, d2 = target_exponents
     else:
         exps = arr.candidate_exponents()
         if exps is None:
             return 1.0
-        d2, d3 = exps
+        d1, d2 = exps
 
     # Build float derivation matrices
-    M_d2 = _float_derivation_matrix(arr, d2)
-    M_d3 = M_d2 if d2 == d3 else _float_derivation_matrix(arr, d3)
+    M_d1 = _float_derivation_matrix(arr, d1)
+    M_d2 = M_d1 if d1 == d2 else _float_derivation_matrix(arr, d2)
 
     # Extract full null space bases
-    V2, k2 = _null_space_basis(M_d2)
+    V2, k2 = _null_space_basis(M_d1)
     if V2 is None or k2 == 0:
         return 1.0
 
-    if d2 == d3:
+    if d1 == d2:
         V3, k3 = V2, k2
         if k3 < 2:
             return 1.0  # need 2 independent derivations from same space
     else:
-        V3, k3 = _null_space_basis(M_d3)
+        V3, k3 = _null_space_basis(M_d2)
         if V3 is None or k3 == 0:
             return 1.0
 
@@ -470,7 +470,7 @@ def smooth_saito_loss(arr, target_exponents=None):
         return 1.0
 
     # Build bilinear tensor
-    T = _build_det_tensor(V2, V3, d2, d3, n)
+    T = _build_det_tensor(V2, V3, d1, d2, n)
 
     # Optimize via ALS
     loss, _, _ = _als_minimize(T, q, n_iters=10, n_restarts=3)
@@ -489,8 +489,8 @@ def algebraic_score(arr: LineArrangement, target_exponents=None) -> float:
 
     Args:
         arr: LineArrangement
-        target_exponents: optional (d2, d3) tuple. If provided, Tier 1 measures
-            distance from current b2 to target_b2 = (n-1) + d2*d3.
+        target_exponents: optional (d1, d2) tuple. If provided, Tier 1 measures
+            distance from current b2 to target_b2 = (n-1) + d1*d2.
 
     Score landscape:
       [-1.0]       product < 0 (b2 too small for any exponents)
@@ -505,9 +505,9 @@ def algebraic_score(arr: LineArrangement, target_exponents=None) -> float:
     b2 = arr.b2()
 
     if target_exponents is not None:
-        d2_t, d3_t = target_exponents
-        target_n = d2_t + d3_t + 1
-        target_b2 = (target_n - 1) + d2_t * d3_t
+        d1_t, d2_t = target_exponents
+        target_n = d1_t + d2_t + 1
+        target_b2 = (target_n - 1) + d1_t * d2_t
         # Tier 1: distance from b2 to target_b2
         # Scale by target_b2 itself (not max_b2) for sharper signal on high-b2 targets
         scale = max(1, target_b2)
@@ -524,7 +524,7 @@ def algebraic_score(arr: LineArrangement, target_exponents=None) -> float:
             # Dense positive signal during growth: reward progress toward target size
             return 0.3 * (n / target_n)  # in (0, 0.3) — grows as arrangement builds
     else:
-        product = b2 - (n - 1)       # = d2 * d3
+        product = b2 - (n - 1)       # = d1 * d2
         disc = (n - 1) ** 2 - 4 * product
 
         # ── Tier 1: discriminant proximity → [-1, 0] ────────────────────────
@@ -703,7 +703,7 @@ def saito_reward(
         terminal_only_free_bonus: Only give w_free at terminal step (len==target_n).
         skip_exact_above: Skip costly sympy exact check for n > this value during training.
                           Instead give a partial bonus based on algebraic score.
-        target_exponents: optional (d2, d3) tuple for exponent-targeted training.
+        target_exponents: optional (d1, d2) tuple for exponent-targeted training.
 
     Returns:
         float reward
@@ -739,8 +739,8 @@ def saito_reward(
 
         # b2 trajectory bonus: guide toward target b2
         if target_exponents is not None:
-            d2_t, d3_t = target_exponents
-            target_b2 = (target_n - 1) + d2_t * d3_t
+            d1_t, d2_t = target_exponents
+            target_b2 = (target_n - 1) + d1_t * d2_t
             reward += w_b2_traj * b2_trajectory_bonus(arr, target_b2, target_n)
 
         # Multiplicity growth: reward creating new triple+ points

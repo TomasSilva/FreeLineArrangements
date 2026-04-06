@@ -347,8 +347,8 @@ def main():
                             help='Use singularity-driven candidate generation')
     exp_parser.add_argument('--max-candidates', type=int, default=200)
     exp_parser.add_argument('--target-exponents', type=int, nargs=2, default=None,
-                            metavar=('D2', 'D3'),
-                            help='Target exponent pair (d2 d3) for exploration')
+                            metavar=('D1', 'D2'),
+                            help='Target exponent pair (d1 d2) for exploration')
 
     # verify-found (post-hoc exact check for large n)
     vf_parser = subparsers.add_parser('verify-found')
@@ -364,8 +364,8 @@ def main():
                             help='Use singularity-driven candidate generation')
     vf_parser.add_argument('--max-candidates', type=int, default=200)
     vf_parser.add_argument('--target-exponents', type=int, nargs=2, default=None,
-                            metavar=('D2', 'D3'),
-                            help='Target exponent pair (d2 d3) for verification')
+                            metavar=('D1', 'D2'),
+                            help='Target exponent pair (d1 d2) for verification')
 
     # discoveries
     subparsers.add_parser('discoveries', help='Show summary of saved discoveries')

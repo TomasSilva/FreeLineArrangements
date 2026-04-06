@@ -149,8 +149,8 @@ class LineArrangement:
         This is the coefficient of t in the characteristic polynomial:
           chi(A, t) = t^3 - n*t^2 + b2*t - b3
 
-        For a free arrangement with exponents (1, d2, d3):
-          b2 = (n-1) + d2*d3,  so  d2*d3 = b2 - (n-1).
+        For a free arrangement with exponents (1, d1, d2):
+          b2 = (n-1) + d1*d2,  so  d1*d2 = b2 - (n-1).
         """
         return sum(m - 1 for m in self.multiplicities())
 
@@ -169,37 +169,37 @@ class LineArrangement:
 
     @staticmethod
     def all_exponent_types(n):
-        """All valid (d2, d3) with 1 <= d2 <= d3 and d2+d3 = n-1."""
-        return [(d2, n - 1 - d2) for d2 in range(1, (n - 1) // 2 + 1)]
+        """All valid (d1, d2) with 1 <= d1 <= d2 and d1+d2 = n-1."""
+        return [(d1, n - 1 - d1) for d1 in range(1, (n - 1) // 2 + 1)]
 
     def candidate_exponents(self):
         """
-        Necessary condition for freeness with exponents (1, d2, d3):
-          d2 + d3 = n-1,  d2*d3 = b2 - (n-1)
-        Returns (d2, d3) as ints, or None.
+        Necessary condition for freeness with exponents (1, d1, d2):
+          d1 + d2 = n-1,  d1*d2 = b2 - (n-1)
+        Returns (d1, d2) as ints, or None.
 
-        Derivation: chi(A, t) = (t-1)(t-d2)(t-d3)
-          => b2 = (n-1) + d2*d3
-          => d2, d3 are roots of  t^2 - (n-1)*t + (b2-(n-1)) = 0
+        Derivation: chi(A, t) = (t-1)(t-d1)(t-d2)
+          => b2 = (n-1) + d1*d2
+          => d1, d2 are roots of  t^2 - (n-1)*t + (b2-(n-1)) = 0
         """
         n = len(self.lines)
         if n < 2:
             return None
         b2 = self.b2()
-        product = b2 - (n - 1)   # = d2 * d3
+        product = b2 - (n - 1)   # = d1 * d2
         if product < 0:
             return None
-        # d2 + d3 = n-1, d2*d3 = product  => disc = (n-1)^2 - 4*product
+        # d1 + d2 = n-1, d1*d2 = product  => disc = (n-1)^2 - 4*product
         disc = (n - 1) ** 2 - 4 * product
         if disc < 0:
             return None
         sq = int(disc ** 0.5 + 0.5)
         if sq * sq != disc:
             return None
-        d2 = ((n - 1) - sq) // 2
-        d3 = ((n - 1) + sq) // 2
-        if d2 + d3 == n - 1 and d2 * d3 == product and d2 >= 0:
-            return int(d2), int(d3)
+        d1 = ((n - 1) - sq) // 2
+        d2 = ((n - 1) + sq) // 2
+        if d1 + d2 == n - 1 and d1 * d2 == product and d1 >= 0:
+            return int(d1), int(d2)
         return None
 
     # ── Polynomial derivation space ───────────────────────────────────────────
@@ -278,47 +278,47 @@ class LineArrangement:
     def is_free(self):
         """
         Check freeness using Saito's criterion.
-        Returns (is_free, exponents) where exponents = (1, d2, d3) or None.
+        Returns (is_free, exponents) where exponents = (1, d1, d2) or None.
         """
         exps = self.candidate_exponents()
         if exps is None:
             return False, None
-        d2, d3 = exps
+        d1, d2 = exps
         n = len(self.lines)
 
-        # For free arrangement: D(A)_d2 has dimension C(d2+1,2)+1 (if d2<=d3)
+        # For free arrangement: D(A)_d1 has dimension C(d1+1,2)+1 (if d1<=d2)
         # We check by finding the null space of the derivation matrix
-        M_d2 = self.derivation_matrix(d2)
-        null_d2 = M_d2.nullspace()
+        M_d1 = self.derivation_matrix(d1)
+        null_d1 = M_d1.nullspace()
 
-        if not null_d2:
+        if not null_d1:
             return False, None
 
-        # Similarly for d3
-        if d2 == d3:
-            null_d3 = null_d2
+        # Similarly for d2
+        if d1 == d2:
+            null_d2 = null_d1
         else:
-            M_d3 = self.derivation_matrix(d3)
-            null_d3 = M_d3.nullspace()
-            if not null_d3:
+            M_d2 = self.derivation_matrix(d2)
+            null_d2 = M_d2.nullspace()
+            if not null_d2:
                 return False, None
 
         # Build Euler derivation (always in D(A)_1)
         monoms1 = self._monoms(1)
-        N1 = len(monoms1)
-        euler = [Rational(0)] * (3 * N1)
+        N_euler = len(monoms1)
+        euler = [Rational(0)] * (3 * N_euler)
         for idx, (ma, mb, mc) in enumerate(monoms1):
             if (ma, mb, mc) == (1, 0, 0): euler[idx] = Rational(1)
-            elif (ma, mb, mc) == (0, 1, 0): euler[N1 + idx] = Rational(1)
-            elif (ma, mb, mc) == (0, 0, 1): euler[2*N1 + idx] = Rational(1)
+            elif (ma, mb, mc) == (0, 1, 0): euler[N_euler + idx] = Rational(1)
+            elif (ma, mb, mc) == (0, 0, 1): euler[2*N_euler + idx] = Rational(1)
 
         # Defining polynomial
         Q = sp.expand(sp.prod(line.linear_form() for line in self.lines))
 
-        # Try all pairs from null_d2 x null_d3
+        # Try all pairs from null_d1 x null_d2
+        monoms_d1 = self._monoms(d1)
         monoms_d2 = self._monoms(d2)
-        monoms_d3 = self._monoms(d3)
-        N2, N3 = len(monoms_d2), len(monoms_d3)
+        N1, N2 = len(monoms_d1), len(monoms_d2)
 
         def vec_to_poly(vec, monoms):
             p = sp.Integer(0)
@@ -344,16 +344,16 @@ class LineArrangement:
         # Euler: f=x, g=y, h=z
         ef, eg, eh = x, y, z
 
-        for v2 in null_d2:
-            f2, g2, h2 = build_theta(list(v2), monoms_d2)
-            for v3 in null_d3:
-                f3, g3, h3 = build_theta(list(v3), monoms_d3)
+        for v2 in null_d1:
+            f2, g2, h2 = build_theta(list(v2), monoms_d1)
+            for v3 in null_d2:
+                f3, g3, h3 = build_theta(list(v3), monoms_d2)
                 # Saito matrix det
                 S = Matrix([[ef, f2, f3], [eg, g2, g3], [eh, h2, h3]])
                 det_S = sp.expand(S.det())
                 ratio = sp.cancel(det_S / Q)
                 if ratio.is_number and ratio != 0:
-                    return True, (1, d2, d3)
+                    return True, (1, d1, d2)
 
         return False, None
 
@@ -383,5 +383,5 @@ class LineArrangement:
 
 # Module-level convenience alias
 def all_exponent_types(n):
-    """All valid (d2, d3) with 1 <= d2 <= d3 and d2+d3 = n-1."""
+    """All valid (d1, d2) with 1 <= d1 <= d2 and d1+d2 = n-1."""
     return LineArrangement.all_exponent_types(n)

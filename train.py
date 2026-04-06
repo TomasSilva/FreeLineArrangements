@@ -198,17 +198,17 @@ def _sample_curriculum_n(n_min, n_max, stats, rng, threshold=0.15):
 
 
 def _all_curriculum_triples(n_min, n_max):
-    """Enumerate all (n, d2, d3) triples for the curriculum."""
+    """Enumerate all (n, d1, d2) triples for the curriculum."""
     triples = []
     for n in range(n_min, n_max + 1):
-        for d2, d3 in all_exponent_types(n):
-            triples.append((n, d2, d3))
+        for d1, d2 in all_exponent_types(n):
+            triples.append((n, d1, d2))
     return triples
 
 
 def _sample_curriculum_triple(triples, stats, rng, threshold=0.15):
     """
-    Sample (target_n, d2, d3) weighted toward under-explored triples.
+    Sample (target_n, d1, d2) weighted toward under-explored triples.
 
     Prioritizes triples with low success rate. Triples with zero discoveries
     get an additional boost.
@@ -224,7 +224,7 @@ def _sample_curriculum_triple(triples, stats, rng, threshold=0.15):
 
     weights = []
     for triple in triples:
-        n, d2, d3 = triple
+        n, d1, d2 = triple
         s = triple_success.get(triple, 0.0)
         eps = triple_episodes.get(triple, 0)
         w = max(0.05, 1.0 - s)
@@ -235,9 +235,9 @@ def _sample_curriculum_triple(triples, stats, rng, threshold=0.15):
         if eps < 10:
             w *= 1.5
         # Boost high-b2 (hard) exponent types — these need more attempts
-        # b2 = (n-1) + d2*d3; ratio = d2*d3 / max_product where max ~= ((n-1)/2)^2
+        # b2 = (n-1) + d1*d2; ratio = d1*d2 / max_product where max ~= ((n-1)/2)^2
         max_product = ((n - 1) / 2) ** 2
-        b2_difficulty = d2 * d3 / max(1, max_product)  # 0 for easy, ~1 for hardest
+        b2_difficulty = d1 * d2 / max(1, max_product)  # 0 for easy, ~1 for hardest
         w *= (1.0 + 2.0 * b2_difficulty)  # up to 3x boost for hardest types
         weights.append(w)
 
@@ -264,7 +264,7 @@ def collect_rollout(
     """
     Collect n_steps transitions across episodes.
 
-    If n_min/n_max are provided, samples a new (target_n, d2, d3) triple
+    If n_min/n_max are provided, samples a new (target_n, d1, d2) triple
     at each episode reset for exponent-targeted curriculum learning.
     """
     n_min = n_min or env.target_n
@@ -272,12 +272,12 @@ def collect_rollout(
     rng = rng or np.random.default_rng(0)
 
     use_curriculum = (n_min != n_max)
-    triples = stats.get('_triples')  # precomputed list of (n, d2, d3)
+    triples = stats.get('_triples')  # precomputed list of (n, d1, d2)
 
     def _sample_next():
         if use_curriculum and triples:
-            n, d2, d3 = _sample_curriculum_triple(triples, stats, rng)
-            return n, (d2, d3)
+            n, d1, d2 = _sample_curriculum_triple(triples, stats, rng)
+            return n, (d1, d2)
         elif use_curriculum:
             return _sample_curriculum_n(n_min, n_max, stats, rng), None
         else:
@@ -446,8 +446,8 @@ class VecRolloutBuffer:
 def _sample_next_triple(triples, stats, rng, n_min, n_max):
     """Sample next (target_n, target_exponents) for an env reset."""
     if triples:
-        n, d2, d3 = _sample_curriculum_triple(triples, stats, rng)
-        return n, (d2, d3)
+        n, d1, d2 = _sample_curriculum_triple(triples, stats, rng)
+        return n, (d1, d2)
     elif n_min != n_max:
         return _sample_curriculum_n(n_min, n_max, stats, rng), None
     else:
@@ -700,9 +700,9 @@ def train(args):
     buffer = VecRolloutBuffer(n_envs) if use_vec else RolloutBuffer()
     rng = np.random.default_rng(42)
 
-    # Precompute all (n, d2, d3) curriculum triples
+    # Precompute all (n, d1, d2) curriculum triples
     triples = _all_curriculum_triples(n_min, n_max)
-    print(f"Curriculum triples: {len(triples)} (n, d2, d3) targets")
+    print(f"Curriculum triples: {len(triples)} (n, d1, d2) targets")
 
     stats = {
         'free_found': 0,

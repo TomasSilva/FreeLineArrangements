@@ -76,7 +76,7 @@ def log_discovery(
 
     Args:
         lines: list of str representations of the lines.
-        exponents: tuple like (1, d2, d3).
+        exponents: tuple like (1, d1, d2).
         b2: second Betti number / t2 value.
         n: number of lines (derived from lines if None).
         max_mult: maximum intersection multiplicity.

@@ -158,8 +158,8 @@ def extract_scalars(arr: LineArrangement, target_n: int,
       [12] mult_entropy  (entropy of multiplicity distribution, normalized)
       [13] singularity_density = sum(C(m,2)) / C(n,2)
       --- exponent targeting ---
-      [14] d2_norm = target_d2 / (target_n - 1)
-      [15] d3_norm = target_d3 / (target_n - 1)
+      [14] d1_norm = target_d1 / (target_n - 1)
+      [15] d2_norm = target_d2 / (target_n - 1)
       [16] b2_progress = 1 - |b2 - target_b2| / max_b2
     """
     n = len(arr)
@@ -206,15 +206,15 @@ def extract_scalars(arr: LineArrangement, target_n: int,
 
     # Exponent-targeting features
     if target_exponents is not None:
-        d2_t, d3_t = target_exponents
+        d1_t, d2_t = target_exponents
+        d1_norm = d1_t / max(1, target_n - 1)
         d2_norm = d2_t / max(1, target_n - 1)
-        d3_norm = d3_t / max(1, target_n - 1)
-        target_b2 = (target_n - 1) + d2_t * d3_t
+        target_b2 = (target_n - 1) + d1_t * d2_t
         scale = max(1, target_b2)
         b2_progress = max(0.0, 1.0 - abs(b2 - target_b2) / scale) if n >= 2 else 0.0
     else:
+        d1_norm = 0.0
         d2_norm = 0.0
-        d3_norm = 0.0
         b2_progress = 0.0
 
     return np.array([
@@ -234,8 +234,8 @@ def extract_scalars(arr: LineArrangement, target_n: int,
         norm_entropy,
         sing_density,
         # exponent-targeting
+        d1_norm,
         d2_norm,
-        d3_norm,
         b2_progress,
     ], dtype=np.float32)
 
@@ -290,7 +290,7 @@ class FreeArrangementEnv:
         self.w_mult = w_mult
         self.w_interest = w_interest
         self.skip_exact_above = skip_exact_above
-        self.target_exponents = None  # (d2, d3) or None
+        self.target_exponents = None  # (d1, d2) or None
 
         # Static pool (always available for bootstrap / diversity)
         self.pool = generate_candidate_lines(coord_range)

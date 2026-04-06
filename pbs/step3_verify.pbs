@@ -17,17 +17,17 @@ export OMP_NUM_THREADS=1   # one core per verify process
 export PYTHONUNBUFFERED=1   # flush print output immediately for real-time monitoring
 
 # Step 3: Parallel exponent-targeted Saito verification
-# For each n >= 13, verify all valid (d2, d3) pairs in parallel (up to 16 at a time).
+# For each n >= 13, verify all valid (d1, d2) pairs in parallel (up to 16 at a time).
 # Each job targets a specific exponent type for exact sympy verification.
 # Monitor with: tail -f logs/verify_*.log
 
 JOBS_FILE=$(mktemp)
 
 for N in 13 14 15 16 17 18 19 20; do
-  MAX_D2=$(( (N - 1) / 2 ))
-  for D2 in $(seq 1 $MAX_D2); do
-    D3=$(( N - 1 - D2 ))
-    echo "python main.py verify-found --n $N --n-max 20 --model model_n20.pt --coord-range 5 --episodes 5000 --singularity-aware --max-candidates 200 --target-exponents $D2 $D3 2>&1 | tee logs/verify_n${N}_d${D2}_${D3}.log" >> "$JOBS_FILE"
+  MAX_D1=$(( (N - 1) / 2 ))
+  for D1 in $(seq 1 $MAX_D1); do
+    D2=$(( N - 1 - D1 ))
+    echo "python main.py verify-found --n $N --n-max 20 --model model_n20.pt --coord-range 5 --episodes 5000 --singularity-aware --max-candidates 200 --target-exponents $D1 $D2 2>&1 | tee logs/verify_n${N}_d${D1}_${D2}.log" >> "$JOBS_FILE"
   done
 done
 
