@@ -175,6 +175,34 @@ def _poly_mult_table(d_a, d_b):
     return np.array(ia_list), np.array(ib_list), np.array(io_list)
 
 
+@lru_cache(maxsize=256)
+def _poly_mult_table_grouped(d_a, d_b):
+    """Multiplication table grouped by output index, sorted for batched matmul.
+
+    Returns:
+        ia_sorted: (L,) int — input-a indices, sorted by output index
+        ib_sorted: (L,) int — input-b indices, sorted by output index
+        offsets: (N_out + 1,) int — start positions in ia_sorted/ib_sorted for each output index
+                 Block for output o is ia_sorted[offsets[o]:offsets[o+1]].
+
+    Used by `_cross_term_tensor` to compute T_term[o] = Va[ia_block].T @ Vb[ib_block]
+    via batched matmul, avoiding the slow `np.add.at` scatter.
+    """
+    ia, ib, io = _poly_mult_table(d_a, d_b)
+    sort_idx = np.argsort(io, kind='stable')
+    ia_sorted = ia[sort_idx]
+    ib_sorted = ib[sort_idx]
+    io_sorted = io[sort_idx]
+
+    _, monoms_out = _monomial_index_map(d_a + d_b)
+    N_out = len(monoms_out)
+    # offsets[o] = first index in io_sorted where io == o (or where it would be)
+    offsets = np.zeros(N_out + 1, dtype=np.int64)
+    counts = np.bincount(io_sorted, minlength=N_out)
+    offsets[1:] = np.cumsum(counts)
+    return ia_sorted, ib_sorted, offsets
+
+
 def _poly_multiply_coeffs(coeffs_a, d_a, coeffs_b, d_b):
     """Multiply two polynomials in coefficient space. Returns output coefficients."""
     _, monoms_out = _monomial_index_map(d_a + d_b)
@@ -215,12 +243,21 @@ def _compute_Q_coefficients(arr):
 # Smooth Saito loss: null space and bilinear tensor
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _null_space_basis(M, tol=1e-10):
+def _null_space_basis(M, tol=1e-10, min_extra=0):
     """Compute orthonormal basis for ker(M) via SVD.
 
+    Args:
+        M: (rows, cols) matrix
+        tol: relative tolerance for determining null vectors
+        min_extra: extra near-null right singular vectors to include beyond the
+            strict null space. Default 0 (use strict null space). NOTE: setting
+            this > 0 breaks the strict Saito derivation condition — the augmented
+            vectors are not true derivations. Useful only as a continuation
+            heuristic when polishing very close to a free arrangement.
+
     Returns:
-        V: (dim, k) matrix where columns are null-space basis vectors, or None
-        k: dimension of null space
+        V: (cols, k) matrix where columns are basis vectors, or None
+        k: dimension of returned subspace
     """
     if M.size == 0:
         return None, 0
@@ -234,16 +271,13 @@ def _null_space_basis(M, tol=1e-10):
         return Vt.T, cols
 
     threshold = max(tol, s[0] * tol)
-    # Number of singular values at or above threshold
     n_significant = int(np.sum(s > threshold))
-    # Null space = columns of V corresponding to zero singular values
-    # In Vt (shape cols x cols if full_matrices=True), rows n_significant..cols-1 are null space
-    k = cols - n_significant
+    k_null = cols - n_significant
+    k = min(cols, k_null + min_extra)
     if k == 0:
         return None, 0
 
-    # Null space basis: last k rows of Vt, transposed to columns
-    V = Vt[n_significant:].T  # shape (cols, k)
+    V = Vt[cols - k:].T  # shape (cols, k)
     return V, k
 
 
@@ -278,8 +312,8 @@ def _build_det_tensor(V2, V3, d1, d2, n):
     V3_g = V3[N2:2*N2]   # (N2, k3)
     V3_h = V3[2*N2:]     # (N2, k3)
 
-    # Precompute the multiplication table for d1 * d2
-    ia, ib, io = _poly_mult_table(d1, d2)
+    # Precompute the multiplication table for d1 * d2 (grouped by output index)
+    ia_sorted, ib_sorted, offsets = _poly_mult_table_grouped(d1, d2)
     _, monoms_nm1 = _monomial_index_map(d1 + d2)  # degree n-1
     N_nm1 = len(monoms_nm1)
 
@@ -290,17 +324,21 @@ def _build_det_tensor(V2, V3, d1, d2, n):
     shift_z = np.array([idx_map_out[(a, b, c+1)] for a, b, c in monoms_nm1])
 
     def _cross_term_tensor(Va, Vb):
-        """Compute tensor for one bilinear product term Va[ia]*Vb[ib] in coefficient space.
+        """Compute T_term[o, a, b] = sum_{(i,j): mult table maps to o} Va[i,a] * Vb[j,b].
 
-        Returns shape (N_nm1, ka, kb).
+        Implementation: for each output index o, T_term[o] = Va[ia_block].T @ Vb[ib_block]
+        where ia_block, ib_block are the input indices that map to o. Each block becomes
+        a single BLAS matmul. For free / near-free arrangements (small null spaces) this is
+        ~the same speed as per-entry outer products; for large null spaces it's much faster
+        because the per-call Python overhead is amortized over a larger matmul.
         """
-        # Va: (N_d1, ka), Vb: (N_d2, kb)
         ka, kb = Va.shape[1], Vb.shape[1]
         T_term = np.zeros((N_nm1, ka, kb), dtype=np.float64)
-        # For each multiplication table entry: out[io[l]] += Va[ia[l]] * Vb[ib[l]]
-        for l in range(len(ia)):
-            # outer product of Va[ia[l], :] and Vb[ib[l], :]
-            T_term[io[l]] += np.outer(Va[ia[l]], Vb[ib[l]])
+        for o in range(N_nm1):
+            start, end = offsets[o], offsets[o + 1]
+            if start == end:
+                continue
+            T_term[o] = Va[ia_sorted[start:end]].T @ Vb[ib_sorted[start:end]]
         return T_term
 
     # 6 cross terms:
@@ -319,7 +357,9 @@ def _build_det_tensor(V2, V3, d1, d2, n):
     T_nm1_y = -(T_f2h3 - T_f3h2)  # coefficient of -y*(...)
     T_nm1_z = (T_f2g3 - T_f3g2)   # coefficient of z*(...)
 
-    # Shift to degree-n monomials
+    # Shift to degree-n monomials. The shift indices may have collisions across
+    # x/y/z (different shifts can land on the same output monomial), so accumulate
+    # via Python loop (N_nm1 is small, ~hundreds).
     T = np.zeros((N_out, k2, k3), dtype=np.float64)
     for j in range(N_nm1):
         T[shift_x[j]] += T_nm1[j]
@@ -419,7 +459,8 @@ def _als_minimize(T, q, n_iters=10, n_restarts=3, rng=None):
     return best_loss, best_a2, best_a3
 
 
-def smooth_saito_loss(arr, target_exponents=None):
+def smooth_saito_loss(arr, target_exponents=None, n_restarts=10, n_iters=10,
+                      min_extra=0):
     """Compute smooth Saito loss for a line arrangement.
 
     Searches over the full null spaces ker(M_d1), ker(M_d2) to find
@@ -430,6 +471,13 @@ def smooth_saito_loss(arr, target_exponents=None):
         arr: LineArrangement
         target_exponents: optional (d1, d2) tuple. If provided, use these
             exponents instead of deriving from the arrangement's b2.
+        n_restarts: number of random restarts for ALS (default 10). Higher values
+            give a more reliable loss at the cost of speed. Use 30-50 for the polish
+            step where reliability matters more than speed.
+        n_iters: number of ALS iterations per restart (default 10).
+        min_extra: number of "near-null" singular vectors to include beyond the
+            strict null space. Default 0 (use only true null space). Use 5-15 in
+            polish_arrangement to make the loss continuous near the free point.
 
     Returns:
         loss: float in [0, 1], where 0 = free arrangement, 1 = far from free
@@ -450,8 +498,8 @@ def smooth_saito_loss(arr, target_exponents=None):
     M_d1 = _float_derivation_matrix(arr, d1)
     M_d2 = M_d1 if d1 == d2 else _float_derivation_matrix(arr, d2)
 
-    # Extract full null space bases
-    V2, k2 = _null_space_basis(M_d1)
+    # Extract null space bases (with optional augmentation for polish continuity)
+    V2, k2 = _null_space_basis(M_d1, min_extra=min_extra)
     if V2 is None or k2 == 0:
         return 1.0
 
@@ -460,7 +508,7 @@ def smooth_saito_loss(arr, target_exponents=None):
         if k3 < 2:
             return 1.0  # need 2 independent derivations from same space
     else:
-        V3, k3 = _null_space_basis(M_d2)
+        V3, k3 = _null_space_basis(M_d2, min_extra=min_extra)
         if V3 is None or k3 == 0:
             return 1.0
 
@@ -473,7 +521,7 @@ def smooth_saito_loss(arr, target_exponents=None):
     T = _build_det_tensor(V2, V3, d1, d2, n)
 
     # Optimize via ALS
-    loss, _, _ = _als_minimize(T, q, n_iters=10, n_restarts=3)
+    loss, _, _ = _als_minimize(T, q, n_iters=n_iters, n_restarts=n_restarts)
     return float(np.clip(loss, 0.0, 1.0))
 
 
@@ -788,5 +836,734 @@ def verify_arrangement(arr: LineArrangement):
     if exps is None:
         return False, None
     return arr.is_free()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Continuous polish: L-BFGS-B in line-coefficient space
+# ─────────────────────────────────────────────────────────────────────────────
+
+def polish_arrangement(
+    arr: LineArrangement,
+    target_exponents=None,
+    fixed_indices=None,
+    max_iter: int = 100,
+    tol: float = 1e-12,
+    n_restarts_loss: int = 30,
+    min_extra: int = 8,
+    method: str = 'L-BFGS-B',
+    verbose: bool = False,
+):
+    """
+    Continuous polish: starting from `arr`, run L-BFGS-B in coefficient space
+    to drive `smooth_saito_loss` to zero, then run the exact `is_free()` check.
+
+    The idea: the RL agent finds arrangements with the right combinatorial type
+    (correct b2, valid candidate exponents, low Saito loss). Polish converts
+    these "near-misses" into actually-free arrangements via gradient descent
+    in the continuous parameter space.
+
+    Args:
+        arr: starting LineArrangement (must have valid candidate_exponents
+            unless `target_exponents` is provided).
+        target_exponents: optional (d1, d2) override.
+        fixed_indices: list of line indices to keep fixed during optimization.
+            Useful for "extend by one line" mode where you want to lock all
+            seed lines and only optimize the new line. Default: fix line 0
+            (to break the global gauge).
+        max_iter: max L-BFGS iterations.
+        tol: stop when smooth loss is below this.
+        n_restarts_loss: ALS restarts inside `smooth_saito_loss` (use 30+ for
+            polish to get a reliable signal).
+        min_extra: extra near-null singular vectors to include in the search
+            subspace, making the loss continuous near the free point. Default 8.
+        method: scipy.optimize method ('L-BFGS-B' for gradient-based,
+            'Nelder-Mead' for gradient-free).
+        verbose: print iteration progress.
+
+    Returns:
+        dict with keys:
+            'success': bool — True if exact `is_free()` returns True after polish.
+            'arrangement': polished LineArrangement (with float coords cast to Rational).
+            'final_loss': final smooth_saito_loss value.
+            'exponents': exact exponents tuple if free, else None.
+            'n_iter': number of L-BFGS iterations performed.
+    """
+    from scipy.optimize import minimize
+
+    n = len(arr)
+    if n < 3:
+        return {'success': False, 'arrangement': arr, 'final_loss': 1.0,
+                'exponents': None, 'n_iter': 0}
+
+    # Determine target exponents
+    if target_exponents is None:
+        exps = arr.candidate_exponents()
+        if exps is None:
+            return {'success': False, 'arrangement': arr, 'final_loss': 1.0,
+                    'exponents': None, 'n_iter': 0}
+        target_exponents = exps
+
+    # Default: fix line 0 to break global scaling/gauge
+    if fixed_indices is None:
+        fixed_indices = [0]
+    fixed_set = set(fixed_indices)
+    free_indices = [i for i in range(n) if i not in fixed_set]
+    n_free = len(free_indices)
+
+    if n_free == 0:
+        # Nothing to optimize — just verify the input directly
+        is_free, exps = arr.is_free()
+        return {'success': bool(is_free), 'arrangement': arr,
+                'final_loss': 0.0 if is_free else 1.0,
+                'exponents': exps if is_free else None, 'n_iter': 0}
+
+    # Initial parameters: float coords of free lines, flattened (3 per line)
+    fixed_lines = [arr.lines[i] for i in fixed_indices]
+    x0 = np.array([
+        [float(c) for c in arr.lines[i].coords]
+        for i in free_indices
+    ], dtype=np.float64).flatten()
+
+    def _build(params):
+        """Build LineArrangement from flat parameter vector + fixed lines."""
+        free_lines = []
+        for k, i in enumerate(free_indices):
+            a, b, c = params[3*k], params[3*k+1], params[3*k+2]
+            try:
+                free_lines.append(ProjectiveLine(
+                    Rational(float(a)).limit_denominator(10**12),
+                    Rational(float(b)).limit_denominator(10**12),
+                    Rational(float(c)).limit_denominator(10**12),
+                ))
+            except (AssertionError, ValueError):
+                # Zero line — return None to signal failure
+                return None
+        # Reassemble in original order
+        all_lines = [None] * n
+        for k, i in enumerate(free_indices):
+            all_lines[i] = free_lines[k]
+        for k, i in enumerate(fixed_indices):
+            all_lines[i] = fixed_lines[k]
+        return LineArrangement(all_lines)
+
+    def _objective(params):
+        candidate = _build(params)
+        if candidate is None:
+            return 1.0
+        try:
+            return smooth_saito_loss(candidate, target_exponents=target_exponents,
+                                     n_restarts=n_restarts_loss,
+                                     min_extra=min_extra)
+        except Exception:
+            return 1.0
+
+    iter_count = [0]
+    best_loss = [_objective(x0)]
+    if verbose:
+        print(f"  polish init loss: {best_loss[0]:.6e}")
+
+    def _callback(xk):
+        iter_count[0] += 1
+        loss = _objective(xk)
+        if loss < best_loss[0]:
+            best_loss[0] = loss
+        if verbose and iter_count[0] % 5 == 0:
+            print(f"  polish iter {iter_count[0]}: loss={loss:.6e}")
+
+    minimize_kwargs = {
+        'method': method,
+        'options': {'maxiter': max_iter},
+        'callback': _callback,
+    }
+    if method == 'L-BFGS-B':
+        minimize_kwargs['jac'] = '2-point'
+        minimize_kwargs['options'].update({'ftol': tol, 'gtol': tol, 'eps': 1e-6})
+    elif method == 'Nelder-Mead':
+        minimize_kwargs['options'].update({'xatol': 1e-8, 'fatol': tol, 'adaptive': True})
+
+    result = minimize(_objective, x0, **minimize_kwargs)
+
+    final_arr = _build(result.x)
+    if final_arr is None:
+        return {'success': False, 'arrangement': arr, 'final_loss': 1.0,
+                'exponents': None, 'n_iter': iter_count[0],
+                'has_cand_exps': False, 'b2': None, 'rationalized': False}
+
+    final_loss = float(result.fun)
+    if verbose:
+        print(f"  polish final loss: {final_loss:.6e}")
+
+    # Rationalization sweep: float polish gives a numerically near-free arrangement,
+    # but the exact b2 may be wrong because float coordinates don't preserve the exact
+    # triple-point coincidences. Try rounding free-line coordinates to nearby rationals
+    # at increasing denominator bounds. The smallest denominator that yields an exactly
+    # free arrangement (b2 correct + sympy is_free) is the target.
+    rationalized = False
+    best_arr = final_arr
+    best_loss = final_loss
+    is_free = False
+    exps = None
+
+    if final_loss < 0.01:  # only try rationalization for near-free results
+        for max_denom in [3, 5, 10, 30, 100, 300, 1000, 3000, 10000]:
+            try:
+                rounded_lines = []
+                for k, i in enumerate(free_indices):
+                    a, b, c = result.x[3*k], result.x[3*k+1], result.x[3*k+2]
+                    rounded_lines.append(ProjectiveLine(
+                        Rational(float(a)).limit_denominator(max_denom),
+                        Rational(float(b)).limit_denominator(max_denom),
+                        Rational(float(c)).limit_denominator(max_denom),
+                    ))
+                all_lines = [None] * n
+                for k, i in enumerate(free_indices):
+                    all_lines[i] = rounded_lines[k]
+                for k, i in enumerate(fixed_indices):
+                    all_lines[i] = fixed_lines[k]
+                test_arr = LineArrangement(all_lines)
+            except Exception:
+                continue
+            if test_arr.candidate_exponents() is None:
+                continue
+            try:
+                free_check, exps_check = test_arr.is_free()
+            except Exception:
+                continue
+            if free_check:
+                is_free = True
+                exps = exps_check
+                best_arr = test_arr
+                best_loss = 0.0
+                rationalized = True
+                if verbose:
+                    print(f"  rationalized at denom={max_denom}: free!")
+                break
+
+    # If no rationalization worked, still try the exact final_arr (already rationalized at 1e12)
+    if not is_free and final_arr.candidate_exponents() is not None:
+        try:
+            is_free_orig, exps_orig = final_arr.is_free()
+            if is_free_orig:
+                is_free = True
+                exps = exps_orig
+                best_arr = final_arr
+                best_loss = 0.0
+        except Exception:
+            pass
+
+    try:
+        b2 = best_arr.b2()
+    except Exception:
+        b2 = None
+    has_cand_exps = best_arr.candidate_exponents() is not None
+
+    return {
+        'success': bool(is_free),
+        'arrangement': best_arr,
+        'final_loss': best_loss,
+        'exponents': exps,
+        'n_iter': iter_count[0],
+        'has_cand_exps': has_cand_exps,
+        'b2': b2,
+        'rationalized': rationalized,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extend by one line: enumerate candidates and verify
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _enumerate_extension_candidates(arr, coord_range=5, include_singularity=True,
+                                      max_denominator=1):
+    """Generate candidate lines for extending `arr` by one line.
+
+    Combines three strategies:
+    1. Lines through pairs of existing intersection points (singularity-driven).
+       These are the most "structural" choices because they preserve intersection
+       coincidences.
+    2. Lines from the small-integer pool (a, b, c) in [-coord_range, coord_range].
+    3. Lines through one existing intersection point with a rational direction
+       (a/d, b/d, c/d) for d up to `max_denominator`. This adds rational lines
+       with controlled denominators that pass through existing structure.
+
+    Args:
+        arr: seed arrangement
+        coord_range: integer pool range
+        include_singularity: enable strategy 1
+        max_denominator: enable strategy 3 if > 1; cap on denominator
+
+    Returns:
+        List of ProjectiveLine objects, deduplicated and excluding lines already in arr.
+    """
+    existing = set(l.coords for l in arr.lines)
+    seen = set()
+    result = []
+
+    if include_singularity:
+        from environment import _singularity_candidates
+        sing = _singularity_candidates(arr)
+        for score, line in sing:
+            if line.coords in existing or line.coords in seen:
+                continue
+            seen.add(line.coords)
+            result.append(line)
+
+    # Pool: small integer coordinates
+    r = coord_range
+    for a in range(-r, r + 1):
+        for b in range(-r, r + 1):
+            for c in range(-r, r + 1):
+                if a == 0 and b == 0 and c == 0:
+                    continue
+                try:
+                    line = ProjectiveLine(a, b, c)
+                except AssertionError:
+                    continue
+                if line.coords in existing or line.coords in seen:
+                    continue
+                seen.add(line.coords)
+                result.append(line)
+
+    # Lines through ONE existing intersection point, with integer direction
+    # Each such line has form: through point P with direction D = (dx, dy, dz)
+    # Parametrize: line normal = P × D (cross product). The new line passes
+    # through P (an existing multiple point) and has small-integer normal coords.
+    if max_denominator > 1:
+        from arrangement import ProjectiveLine as PL
+        pts = arr._structure() if len(arr) >= 2 else {}
+        # Use only multiple points (multiplicity >= 2)
+        mult_pts = [pt for pt, lines_through in pts.items() if len(lines_through) >= 2]
+        for pt in mult_pts:
+            px, py, pz = [float(c) for c in pt]
+            for dx in range(-coord_range, coord_range + 1):
+                for dy in range(-coord_range, coord_range + 1):
+                    for dz in range(-coord_range, coord_range + 1):
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+                        # New line has normal = pt × direction
+                        nx = py * dz - pz * dy
+                        ny = pz * dx - px * dz
+                        nz = px * dy - py * dx
+                        if abs(nx) < 1e-12 and abs(ny) < 1e-12 and abs(nz) < 1e-12:
+                            continue
+                        try:
+                            from sympy import Rational
+                            new_line = PL(
+                                Rational(float(nx)).limit_denominator(max_denominator * 100),
+                                Rational(float(ny)).limit_denominator(max_denominator * 100),
+                                Rational(float(nz)).limit_denominator(max_denominator * 100),
+                            )
+                        except (AssertionError, ValueError):
+                            continue
+                        if new_line.coords in existing or new_line.coords in seen:
+                            continue
+                        seen.add(new_line.coords)
+                        result.append(new_line)
+
+    return result
+
+
+def extend_arrangement(
+    seed_arr: LineArrangement,
+    coord_range: int = 5,
+    loss_threshold: float = 0.05,
+    n_restarts: int = 10,
+    max_denominator: int = 1,
+    verbose: bool = False,
+    target_exponents=None,
+):
+    """Extend a free arrangement by one line, returning all valid extensions.
+
+    For each candidate line L (from singularity + small-integer pool):
+        1. Build new_arr = seed_arr + [L]
+        2. Quick reject: skip if new_arr.candidate_exponents() is None
+        3. Pre-filter: skip if smooth_saito_loss(new_arr) > loss_threshold
+        4. Verify exactly via new_arr.is_free()
+        5. If free, record it.
+
+    Args:
+        seed_arr: known free arrangement to extend.
+        coord_range: integer pool range for the new line.
+        loss_threshold: pre-filter threshold (skip exact check if loss above this).
+            Lower values are faster but may miss valid extensions; 0.05 is a good
+            starting point.
+        n_restarts: ALS restarts in the loss pre-filter (default 10).
+        verbose: print per-candidate diagnostics.
+        target_exponents: optional (d1, d2) override for the smooth loss filter.
+
+    Returns:
+        List of dicts, one per successful extension:
+            {'arrangement': new free LineArrangement,
+             'exponents': (1, d1, d2),
+             'new_line': the added ProjectiveLine,
+             'loss': pre-filter loss (≈0)}
+    """
+    candidates = _enumerate_extension_candidates(
+        seed_arr, coord_range=coord_range, max_denominator=max_denominator)
+    n_seed = len(seed_arr)
+    if verbose:
+        print(f"  {n_seed} seed lines, {len(candidates)} candidate extensions")
+
+    successes = []
+    n_passed_filter = 0
+    n_passed_combinatorial = 0
+
+    for idx, line in enumerate(candidates):
+        new_arr = LineArrangement(list(seed_arr.lines) + [line])
+
+        # Cheap combinatorial pre-filter: candidate exponents must exist
+        cand_exps = new_arr.candidate_exponents()
+        if cand_exps is None:
+            continue
+        n_passed_combinatorial += 1
+
+        tgt = target_exponents if target_exponents is not None else cand_exps
+
+        # Smooth loss pre-filter
+        try:
+            loss = smooth_saito_loss(new_arr, target_exponents=tgt, n_restarts=n_restarts)
+        except Exception:
+            continue
+        if loss > loss_threshold:
+            continue
+        n_passed_filter += 1
+
+        # Exact verification
+        try:
+            is_free, exps = new_arr.is_free()
+        except Exception:
+            continue
+        if not is_free:
+            continue
+
+        successes.append({
+            'arrangement': new_arr,
+            'exponents': exps,
+            'new_line': line,
+            'loss': float(loss),
+        })
+        if verbose:
+            print(f"  [{idx}/{len(candidates)}] FREE: line={line}, exps={exps}, loss={loss:.2e}")
+
+    if verbose:
+        print(f"  combinatorial: {n_passed_combinatorial}, "
+              f"loss-filter passed: {n_passed_filter}, "
+              f"exact-free: {len(successes)}")
+    return successes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Δb2 prediction and targeted extension
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _line_score_and_count(line, pts):
+    """For a candidate line L and existing intersection points dict (point -> set of line indices),
+    return (S, k) where:
+        S = sum of multiplicities of existing points that L passes through
+        k = number of distinct existing points that L passes through
+
+    Used by extend_arrangement_targeted to predict Δb2 = n + k - S without
+    actually building the new arrangement.
+    """
+    S = 0
+    k = 0
+    for pt, lines_through in pts.items():
+        if line.passes_through(pt):
+            S += len(lines_through)
+            k += 1
+    return S, k
+
+
+def predicted_delta_b2(line, seed_arr):
+    """Predict the change in b2 if `line` is added to `seed_arr`.
+
+    Δb2 = n_seed + k - S, where S is the multiplicity sum and k is the
+    number of existing intersection points L passes through.
+    """
+    n_seed = len(seed_arr)
+    if n_seed < 2:
+        return 0
+    pts = seed_arr._structure()
+    S, k = _line_score_and_count(line, pts)
+    return n_seed + k - S
+
+
+def extend_arrangement_targeted(
+    seed_arr: LineArrangement,
+    target_exponents,
+    coord_range: int = 5,
+    loss_threshold: float = 0.05,
+    n_restarts: int = 10,
+    max_denominator: int = 1,
+    verbose: bool = False,
+):
+    """Extend a free arrangement by one line, targeting a specific (d1', d2') for n+1.
+
+    Differs from extend_arrangement in two ways:
+      1. Pre-filters candidates by computing Δb2 = n + k - S and accepting only
+         those whose Δb2 matches the target.
+      2. Adapts the candidate pool to the required Δb2:
+         - small Δb2 (target line through many points) -> singularity-driven
+         - large Δb2 (target line avoids existing structure) -> small-integer pool
+         - intermediate -> both
+
+    Args:
+        seed_arr: known free arrangement to extend.
+        target_exponents: (d1', d2') for the n+1-line result.
+        coord_range, loss_threshold, n_restarts, max_denominator, verbose: same as
+            extend_arrangement.
+
+    Returns:
+        List of dicts (same format as extend_arrangement). Each dict has the
+        new free arrangement, exponents, the added line, and the smooth loss
+        value at filter time.
+    """
+    n_seed = len(seed_arr)
+    b2_seed = seed_arr.b2()
+    d1_t, d2_t = target_exponents
+    b2_target = n_seed + d1_t * d2_t
+    delta_required = b2_target - b2_seed
+
+    if verbose:
+        print(f"  seed: n={n_seed}, b2={b2_seed}; target exps=(1,{d1_t},{d2_t}), "
+              f"b2_target={b2_target}, Δb2_required={delta_required}")
+
+    # Sanity bounds: a single new line can change b2 by at most n+1 (k=1, S=0)
+    # and at least 1 (k=0, S=0 only if the line meets nothing — impossible since
+    # it always meets the n existing lines somewhere, but those somewheres can
+    # land on existing points). Strict bound: 1 ≤ Δb2 ≤ n+1.
+    if delta_required < 1 or delta_required > n_seed + 1:
+        if verbose:
+            print(f"  Δb2_required={delta_required} is out of range [1, {n_seed+1}] — impossible")
+        return []
+
+    # Decide which candidate strategies to use based on Δb2 regime
+    # Small Δb2 -> need lines through many existing points (singularity-driven)
+    # Large Δb2 -> need lines through few existing points (pool, large coord_range)
+    use_singularity = delta_required <= n_seed - 2  # leaves room for k >= 1
+    # For large Δb2, expand the integer pool to find more "generic" lines
+    if delta_required >= n_seed - 1:
+        # Want lines that avoid existing structure entirely
+        candidates = _enumerate_extension_candidates(
+            seed_arr, coord_range=max(coord_range, 10),
+            include_singularity=False, max_denominator=1)
+    else:
+        candidates = _enumerate_extension_candidates(
+            seed_arr, coord_range=coord_range,
+            include_singularity=use_singularity,
+            max_denominator=max_denominator)
+
+    if verbose:
+        print(f"  enumerated {len(candidates)} candidates "
+              f"(singularity={use_singularity}, expanded_pool={delta_required >= n_seed - 1})")
+
+    pts = seed_arr._structure() if n_seed >= 2 else {}
+
+    # Δb2 pre-filter
+    matched = []
+    for line in candidates:
+        S, k = _line_score_and_count(line, pts)
+        delta = n_seed + k - S
+        if delta == delta_required:
+            matched.append(line)
+
+    if verbose:
+        print(f"  Δb2-filtered: {len(matched)}/{len(candidates)} match Δb2={delta_required}")
+
+    successes = []
+    for idx, line in enumerate(matched):
+        new_arr = LineArrangement(list(seed_arr.lines) + [line])
+
+        # Combinatorial check (must give the target exponents)
+        cand_exps = new_arr.candidate_exponents()
+        if cand_exps is None or cand_exps != target_exponents:
+            continue
+
+        # Smooth loss pre-filter
+        try:
+            loss = smooth_saito_loss(new_arr, target_exponents=target_exponents,
+                                     n_restarts=n_restarts)
+        except Exception:
+            continue
+        if loss > loss_threshold:
+            continue
+
+        # Exact verification
+        try:
+            is_free, exps = new_arr.is_free()
+        except Exception:
+            continue
+        if not is_free:
+            continue
+
+        successes.append({
+            'arrangement': new_arr,
+            'exponents': exps,
+            'new_line': line,
+            'loss': float(loss),
+        })
+        if verbose:
+            print(f"  [{idx}/{len(matched)}] FREE: line={line}, exps={exps}, loss={loss:.2e}")
+
+    if verbose:
+        print(f"  exact-free: {len(successes)}")
+    return successes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Direct constructions for known free families
+# ─────────────────────────────────────────────────────────────────────────────
+
+def construct_near_pencil(n: int) -> LineArrangement:
+    """Construct a near-pencil arrangement: n-1 lines through a single point + 1 transversal.
+
+    The result is a free arrangement with exponents (1, 1, n-2). This is one of the
+    classical free arrangement families and is trivially free by closed-form construction
+    (no search or polish needed).
+
+    The pencil apex is the point [0:0:1] (i.e., the point at z-infinity in chart z=1).
+    The pencil consists of n-1 lines through that apex, parameterized as
+    `i*x + j*y = 0` for distinct (i, j) pairs. The transversal is `z = 0`.
+
+    Args:
+        n: total number of lines (must be >= 3).
+
+    Returns:
+        LineArrangement with n lines, free with exponents (1, 1, n-2).
+    """
+    if n < 3:
+        raise ValueError(f"near-pencil requires n >= 3, got {n}")
+    # Apex at [0:0:1]: lines through it have c = 0, i.e. ax + by = 0.
+    # Generate n-1 such lines with distinct (a:b) ratios using small integers.
+    # We pick (1,0), (0,1), then (i, 1) for i = 1, 2, ..., -1, -2, ... and
+    # (1, j) for j = 2, 3, ... as needed. This ensures projective distinctness.
+    lines = []
+    seen = set()
+
+    def _add(a, b, c):
+        try:
+            line = ProjectiveLine(a, b, c)
+        except (AssertionError, ValueError):
+            return False
+        if line.coords in seen:
+            return False
+        seen.add(line.coords)
+        lines.append(line)
+        return True
+
+    # Always start with the two coordinate lines through [0:0:1]
+    _add(1, 0, 0)
+    _add(0, 1, 0)
+    # Then add lines a*x + b*y = 0 with small a, b
+    for s in range(1, 100):  # Spiral outward in size
+        for a in range(-s, s + 1):
+            for b in range(-s, s + 1):
+                if abs(a) != s and abs(b) != s:
+                    continue
+                if a == 0 and b == 0:
+                    continue
+                if len(lines) >= n - 1:
+                    break
+                _add(a, b, 0)
+            if len(lines) >= n - 1:
+                break
+        if len(lines) >= n - 1:
+            break
+
+    if len(lines) < n - 1:
+        raise RuntimeError(f"Could not generate {n-1} pencil lines")
+
+    # Add the transversal z = 0
+    _add(0, 0, 1)
+    return LineArrangement(lines)
+
+
+def construct_supersolvable(n: int, d1: int) -> LineArrangement:
+    """Construct a supersolvable free arrangement with exponents (1, d1, n-1-d1).
+
+    Construction: two pencils sharing one common line.
+      - Pencil 1 centered at [0:0:1] (lines of form a*x + b*y = 0): contains (d1 + 1) lines
+      - Pencil 2 centered at [0:1:0] (lines of form a*x + c*z = 0): contains (n - d1) lines
+      - The shared line is x = 0 (which lies in both pencils since (1,0,0) has both b=0 and c=0)
+      - Total: (d1 + 1) + (n - d1) - 1 = n lines
+
+    By Terao's supersolvability theorem, this arrangement is free with exponents
+    (1, d1, n - 1 - d1). The smaller pencil contributes the d1 exponent.
+
+    Args:
+        n: total number of lines.
+        d1: smaller exponent (1 ≤ d1 ≤ (n-1)//2). If d1=1 this gives (1,1,n-2)
+            (same as construct_near_pencil but via the supersolvable construction).
+
+    Returns:
+        LineArrangement with n lines, free with exponents (1, d1, n - 1 - d1).
+    """
+    if d1 < 1 or d1 > n - 1 - d1:
+        raise ValueError(f"need 1 <= d1 <= (n-1)//2, got d1={d1}, n={n}")
+
+    n_pencil_1 = d1 + 1   # contributes d1 exponent
+    n_pencil_2 = n - d1   # contributes (n - 1 - d1) exponent
+
+    lines = []
+    seen = set()
+
+    def _add(a, b, c):
+        try:
+            line = ProjectiveLine(a, b, c)
+        except (AssertionError, ValueError):
+            return False
+        if line.coords in seen:
+            return False
+        seen.add(line.coords)
+        lines.append(line)
+        return True
+
+    # Shared line: x = 0  (a=1, b=0, c=0). It is in both pencils.
+    _add(1, 0, 0)
+
+    # Pencil 1 (through [0:0:1]): a*x + b*y = 0 with b ≠ 0 (else duplicates x=0)
+    # Need (n_pencil_1 - 1) more lines (the shared one is already in).
+    # Use small integer (a, b) ratios.
+    target_p1 = n_pencil_1 - 1
+    count = 0
+    s = 1
+    while count < target_p1 and s < 1000:
+        for a in range(-s, s + 1):
+            for b in range(-s, s + 1):
+                if abs(a) != s and abs(b) != s:
+                    continue
+                if b == 0:  # exclude x=0 (already added)
+                    continue
+                if _add(a, b, 0):
+                    count += 1
+                    if count >= target_p1:
+                        break
+            if count >= target_p1:
+                break
+        s += 1
+
+    # Pencil 2 (through [0:1:0]): a*x + c*z = 0 with c ≠ 0 (else duplicates x=0)
+    # Need (n_pencil_2 - 1) more lines.
+    target_p2 = n_pencil_2 - 1
+    count = 0
+    s = 1
+    while count < target_p2 and s < 1000:
+        for a in range(-s, s + 1):
+            for c in range(-s, s + 1):
+                if abs(a) != s and abs(c) != s:
+                    continue
+                if c == 0:  # exclude x=0 (already added)
+                    continue
+                if _add(a, 0, c):
+                    count += 1
+                    if count >= target_p2:
+                        break
+            if count >= target_p2:
+                break
+        s += 1
+
+    if len(lines) != n:
+        raise RuntimeError(f"Built {len(lines)} lines, expected {n}")
+    return LineArrangement(lines)
 
 

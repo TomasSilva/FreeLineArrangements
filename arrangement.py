@@ -102,6 +102,11 @@ class LineArrangement:
             self.lines.pop()
             self._cache = None
 
+    def remove_line(self, index):
+        """Remove the line at the given index (clears intersection cache)."""
+        del self.lines[index]
+        self._cache = None
+
     def copy(self):
         arr = LineArrangement(list(self.lines))
         return arr

@@ -1,0 +1,56 @@
+#!/bin/bash
+#PBS -N free_arr_extend
+#PBS -q par16
+#PBS -l nodes=1:ppn=16
+#PBS -l walltime=24:00:00
+#PBS -e logs/extend.err
+#PBS -o logs/extend.out
+#PBS -m abe
+
+cd $PBS_O_WORKDIR
+echo "Job starting:" `date`
+mkdir -p logs
+
+module load python/3.8.11-intel-2021.3.0
+source free_arr/bin/activate
+export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+# Step 4: Bootstrap-extend known free arrangements by one line.
+#
+# Strategy: load free arrangements from discoveries.json, take each as a seed,
+# enumerate candidate extension lines (singularity-driven + small-integer pool +
+# rational lines through multiple points), pre-filter via smooth_saito_loss,
+# and exact-verify with sympy. This is the "hybrid" approach that bypasses the
+# RL agent's failure to discover free arrangements for n >= 14.
+#
+# We run sequentially (not cascaded) so each level uses what was found before:
+#   step 1: n=12 -> n=13 extensions  (uses existing discoveries.json seeds)
+#   step 2: n=13 -> n=14 extensions  (now includes new n=13 from step 1)
+#   ...
+#   step 8: n=19 -> n=20 extensions
+#
+# Within each level, parallelize across seeds using --max-seeds chunks.
+
+# Cascade: each level depends on the previous, so they run sequentially
+for N_FROM in 12 13 14 15 16 17 18 19; do
+  N_TO=$(( N_FROM + 1 ))
+  echo ""
+  echo "=== Extending n=$N_FROM -> n=$N_TO ==="
+  date
+  python main.py extend \
+    --n-from $N_FROM \
+    --seeds-file discoveries.json \
+    --output discoveries.json \
+    --coord-range 5 \
+    --max-denominator 1 \
+    --loss-threshold 0.05 \
+    --n-restarts 10 \
+    2>&1 | tee "logs/extend_n${N_FROM}_to_${N_TO}.log"
+done
+
+echo ""
+echo "Final discoveries summary:"
+python main.py discoveries 2>&1 | tee logs/extend_summary.log
+
+echo "Job completed:" `date`

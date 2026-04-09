@@ -247,6 +247,249 @@ def run_verify_found(args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Extend mode: bootstrap from known free arrangements at n_from to find n_from+1
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_line_str(s):
+    """Parse a line string '(ax+by+cz=0)' into a ProjectiveLine with exact rationals."""
+    import re
+    from fractions import Fraction
+    from sympy import Rational
+    s = s.strip().strip('(').rstrip(')').replace('=0', '').replace(' ', '').replace('+-', '-')
+    m = re.match(r'([+-]?[\d/]*)x([+-][\d/]*)y([+-][\d/]*)z', s)
+    if not m:
+        raise ValueError(f"Cannot parse line: {s}")
+    def to_rat(c):
+        c = c.strip('+')
+        if c in ('', '+'):
+            return 1
+        if c == '-':
+            return -1
+        return Fraction(c)
+    return ProjectiveLine(
+        Rational(to_rat(m.group(1))),
+        Rational(to_rat(m.group(2))),
+        Rational(to_rat(m.group(3))),
+    )
+
+
+def run_extend(args):
+    """
+    Bootstrap-extend mode: load known free arrangements at n_from, attempt to
+    extend each by one line, and save successful n_from+1 free arrangements.
+
+    For each seed arrangement, enumerates candidate lines from:
+      - Lines through pairs of existing intersection points (singularity-driven)
+      - Small-integer pool (a, b, c) in [-coord_range, coord_range]
+      - Optionally rational lines through existing multiple points
+
+    Each candidate is pre-filtered by `smooth_saito_loss` (fast) before the
+    expensive exact `is_free()` check.
+    """
+    import json
+    import time
+    from saito import extend_arrangement, extend_arrangement_targeted
+    from arrangement import all_exponent_types
+
+    # Load seeds
+    print(f"Loading seeds from {args.seeds_file}...")
+    with open(args.seeds_file) as f:
+        data = json.load(f)
+    arrs = data.get('arrangements', data) if isinstance(data, dict) else data
+    seeds = [a for a in arrs if a.get('n') == args.n_from]
+    print(f"Found {len(seeds)} seeds at n={args.n_from}")
+
+    if args.target_exponents:
+        d1_t, d2_t = args.target_exponents
+        seeds = [s for s in seeds if tuple(s.get('exponents', [None,None,None])[1:]) == (d1_t, d2_t)]
+        print(f"Filtered to {len(seeds)} seeds with exponents (1, {d1_t}, {d2_t})")
+
+    if args.max_seeds is not None:
+        seeds = seeds[:args.max_seeds]
+        print(f"Using first {len(seeds)} seeds")
+
+    if not seeds:
+        print("No seeds — aborting.")
+        return
+
+    # Determine target list for the new arrangements
+    n_new = args.n_from + 1
+    if args.all_targets:
+        target_list = all_exponent_types(n_new)
+        print(f"--all-targets: enumerating {len(target_list)} target exponent types: {target_list}")
+    elif args.target_new_exponents:
+        target_list = [tuple(args.target_new_exponents)]
+        print(f"--target-new-exponents: targeting {target_list[0]} for n={n_new}")
+    else:
+        target_list = None  # use unfiltered extend_arrangement
+
+    all_extensions = []
+    t_total = time.perf_counter()
+    for i, rec in enumerate(seeds):
+        try:
+            seed_lines = [_parse_line_str(s) for s in rec['lines']]
+        except Exception as e:
+            print(f"  Seed {i+1}: parse error: {e}")
+            continue
+        seed_arr = LineArrangement(seed_lines)
+
+        t0 = time.perf_counter()
+        if target_list is None:
+            # Unfiltered: original extend_arrangement
+            results = extend_arrangement(
+                seed_arr,
+                coord_range=args.coord_range,
+                loss_threshold=args.loss_threshold,
+                n_restarts=args.n_restarts,
+                max_denominator=args.max_denominator,
+                verbose=False,
+            )
+        else:
+            # Targeted: loop over each target
+            results = []
+            for target in target_list:
+                sub_results = extend_arrangement_targeted(
+                    seed_arr,
+                    target_exponents=target,
+                    coord_range=args.coord_range,
+                    loss_threshold=args.loss_threshold,
+                    n_restarts=args.n_restarts,
+                    max_denominator=args.max_denominator,
+                    verbose=False,
+                )
+                results.extend(sub_results)
+        elapsed = time.perf_counter() - t0
+        print(f"Seed {i+1}/{len(seeds)} (exps={rec.get('exponents')}): "
+              f"{len(results)} extensions in {elapsed:.1f}s")
+        all_extensions.extend(results)
+
+    print(f"\n{'='*60}")
+    print(f"Total: {len(all_extensions)} free n={args.n_from + 1} arrangements found")
+    print(f"Total time: {time.perf_counter() - t_total:.1f}s")
+
+    if not all_extensions:
+        return
+
+    # Convert to discovery records
+    records = []
+    for r in all_extensions:
+        new_arr = r['arrangement']
+        s = new_arr.summary()
+        records.append({
+            'lines': [str(l) for l in new_arr.lines],
+            'exponents': r['exponents'],
+            'b2': s['b2'],
+            'n': len(new_arr),
+            'max_mult': new_arr.max_multiplicity(),
+            'mult_profile': sorted(s['multiplicity_profile'], reverse=True),
+        })
+
+    # Group by exponents for printing
+    from collections import Counter
+    by_exps = Counter(tuple(r['exponents']) for r in records)
+    print(f"By exponents: {dict(by_exps)}")
+
+    n_new = log_discoveries(records, source="extend",
+                            path=args.output if args.output else "discoveries.json")
+    print(f"Saved {n_new} new discoveries to {args.output or 'discoveries.json'}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Construct: direct construction of known free arrangement families
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_construct(args):
+    """
+    Direct construction of known free arrangement families. No search, no RL —
+    just emit a closed-form free arrangement and save it to discoveries.
+
+    Supports:
+      - --family near-pencil: (1, 1, n-2) for any n >= 3
+      - --family supersolvable --d1 K: (1, K, n-1-K) for any n, 1 <= K <= (n-1)//2
+      - --family all-supersolvable: emit one supersolvable for each valid (d1, d2) at level n
+    """
+    from saito import construct_near_pencil, construct_supersolvable
+    from arrangement import all_exponent_types
+
+    n = args.n
+    family = args.family
+    output = args.output or "discoveries.json"
+
+    records = []
+
+    if family == 'near-pencil':
+        if n < 3:
+            print(f"near-pencil requires n >= 3, got {n}")
+            return
+        arr = construct_near_pencil(n)
+        is_free, exps = arr.is_free()
+        if not is_free:
+            print(f"ERROR: constructed near-pencil is not free!")
+            return
+        s = arr.summary()
+        records.append({
+            'lines': [str(l) for l in arr.lines],
+            'exponents': list(exps),
+            'b2': s['b2'],
+            'n': n,
+            'max_mult': arr.max_multiplicity(),
+            'mult_profile': sorted(s['multiplicity_profile'], reverse=True),
+        })
+        print(f"Constructed near-pencil for n={n}: exps={exps}")
+
+    elif family == 'supersolvable':
+        if args.d1 is None:
+            print("--d1 is required for --family supersolvable")
+            return
+        d1 = args.d1
+        if d1 < 1 or d1 > (n - 1) // 2:
+            print(f"--d1 must be in [1, {(n-1)//2}], got {d1}")
+            return
+        arr = construct_supersolvable(n, d1)
+        is_free, exps = arr.is_free()
+        if not is_free:
+            print(f"ERROR: constructed supersolvable is not free!")
+            return
+        s = arr.summary()
+        records.append({
+            'lines': [str(l) for l in arr.lines],
+            'exponents': list(exps),
+            'b2': s['b2'],
+            'n': n,
+            'max_mult': arr.max_multiplicity(),
+            'mult_profile': sorted(s['multiplicity_profile'], reverse=True),
+        })
+        print(f"Constructed supersolvable for n={n}, d1={d1}: exps={exps}")
+
+    elif family == 'all-supersolvable':
+        if n < 3:
+            print(f"all-supersolvable requires n >= 3, got {n}")
+            return
+        for d1, d2 in all_exponent_types(n):
+            arr = construct_supersolvable(n, d1)
+            is_free, exps = arr.is_free()
+            if not is_free:
+                print(f"  d1={d1}: ERROR — not free!")
+                continue
+            s = arr.summary()
+            records.append({
+                'lines': [str(l) for l in arr.lines],
+                'exponents': list(exps),
+                'b2': s['b2'],
+                'n': n,
+                'max_mult': arr.max_multiplicity(),
+                'mult_profile': sorted(s['multiplicity_profile'], reverse=True),
+            })
+            print(f"  d1={d1}: exps={exps}, profile={sorted(s['multiplicity_profile'], reverse=True)}")
+    else:
+        print(f"Unknown family: {family}")
+        return
+
+    n_new = log_discoveries(records, source=f"construct-{family}", path=output)
+    print(f"\nSaved {n_new} new discoveries to {output}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Manual search: exhaustive/random search for small n
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -370,6 +613,44 @@ def main():
     # discoveries
     subparsers.add_parser('discoveries', help='Show summary of saved discoveries')
 
+    # extend (bootstrap from known free arrangements)
+    ext_parser = subparsers.add_parser('extend', help='Extend known free arrangements by one line')
+    ext_parser.add_argument('--n-from', type=int, required=True,
+                            help='Source n: load free arrangements with this n as seeds')
+    ext_parser.add_argument('--seeds-file', type=str, default='discoveries.json',
+                            help='JSON file with seed arrangements (default: discoveries.json)')
+    ext_parser.add_argument('--output', type=str, default=None,
+                            help='Output file for new discoveries (default: same as seeds-file)')
+    ext_parser.add_argument('--coord-range', type=int, default=5,
+                            help='Integer pool coordinate range for new lines')
+    ext_parser.add_argument('--max-denominator', type=int, default=1,
+                            help='If >1, also generate rational lines through existing multiple points')
+    ext_parser.add_argument('--loss-threshold', type=float, default=0.05,
+                            help='Pre-filter: skip exact check if smooth loss above this')
+    ext_parser.add_argument('--n-restarts', type=int, default=10,
+                            help='ALS restarts in the smooth loss pre-filter')
+    ext_parser.add_argument('--max-seeds', type=int, default=None,
+                            help='Limit number of seeds to process (for testing)')
+    ext_parser.add_argument('--target-exponents', type=int, nargs=2, default=None,
+                            metavar=('D1', 'D2'),
+                            help='Only use seeds with these exponents')
+    ext_parser.add_argument('--target-new-exponents', type=int, nargs=2, default=None,
+                            metavar=('D1', 'D2'),
+                            help='Target this exponent type for the n+1 result. Uses Δb2 pre-filter for efficiency.')
+    ext_parser.add_argument('--all-targets', action='store_true',
+                            help='Target ALL valid exponent types for the n+1 result (overrides --target-new-exponents).')
+
+    # construct (direct construction of known free families)
+    con_parser = subparsers.add_parser('construct', help='Construct a known free arrangement family directly')
+    con_parser.add_argument('--family', choices=['near-pencil', 'supersolvable', 'all-supersolvable'],
+                            required=True,
+                            help='Which family to construct')
+    con_parser.add_argument('--n', type=int, required=True, help='Number of lines')
+    con_parser.add_argument('--d1', type=int, default=None,
+                            help='Smaller exponent (only for --family supersolvable)')
+    con_parser.add_argument('--output', type=str, default=None,
+                            help='Output JSON file (default: discoveries.json)')
+
     # search
     search_parser = subparsers.add_parser('search')
     search_parser.add_argument('--n', type=int, default=6)
@@ -393,6 +674,10 @@ def main():
         run_explore(args)
     elif args.command == 'verify-found':
         run_verify_found(args)
+    elif args.command == 'extend':
+        run_extend(args)
+    elif args.command == 'construct':
+        run_construct(args)
     elif args.command == 'search':
         run_search(args)
     elif args.command == 'discoveries':

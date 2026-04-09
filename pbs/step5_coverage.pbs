@@ -1,0 +1,135 @@
+#!/bin/bash
+#PBS -N free_arr_coverage
+#PBS -q par16
+#PBS -l nodes=1:ppn=16
+#PBS -l walltime=72:00:00
+#PBS -e logs/coverage.err
+#PBS -o logs/coverage.out
+#PBS -m abe
+
+cd $PBS_O_WORKDIR
+echo "Job starting:" `date`
+mkdir -p logs
+mkdir -p coverage_intermediate
+
+module load python/3.8.11-intel-2021.3.0
+source free_arr/bin/activate
+export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 5: Comprehensive coverage of all (n, d1, d2) exponent cells.
+#
+# Goal: produce at least one free arrangement for EVERY valid (1, d1, d2) at
+#       every n in 6..20. For n=20 this means filling all 9 cells:
+#       (1,1,18), (1,2,17), ..., (1,9,10).
+#
+# Strategy (two phases):
+#   PHASE A — Closed-form constructions (instant).
+#       For each n in 6..20, construct one supersolvable arrangement for every
+#       valid (d1, d2). This guarantees at least one example per cell with
+#       no search at all. Sequential — no race conditions.
+#
+#   PHASE B — Targeted Δb2 extension (parallel within each level).
+#       Cascade level by level. At each level n_from -> n_to=n_from+1:
+#         1. Snapshot discoveries.json -> seeds_n${N_FROM}.json (frozen for the level)
+#         2. For each target (d1, d2) at n_to, queue a job that processes ALL
+#            n_from seeds with Δb2 pre-filter.
+#         3. Each job writes to its OWN unique output JSON to avoid races.
+#         4. Run all targets in parallel via xargs -P 16.
+#         5. After all jobs finish, merge per-target outputs into discoveries.json
+#            via discoveries.log_discoveries (which deduplicates).
+#         6. Move to next level.
+#
+# Race-condition safety: parallel jobs only READ from seeds_n${N_FROM}.json
+# (immutable for the duration of the level) and WRITE to disjoint output files.
+# discoveries.json is only updated by the sequential merge step.
+#
+# To start from existing discoveries (e.g., from step1/step2/step4 cascade),
+# `cp` the file to discoveries.json before submitting this job.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── PHASE A: closed-form supersolvable constructions ────────────────────────
+echo ""
+echo "============================================================"
+echo "PHASE A: closed-form supersolvable constructions"
+echo "============================================================"
+date
+
+for N in 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  python main.py construct --family all-supersolvable --n $N \
+    --output discoveries.json \
+    2>&1 | tee "logs/construct_n${N}.log"
+done
+
+# ── PHASE B: level-by-level targeted extension cascade ──────────────────────
+echo ""
+echo "============================================================"
+echo "PHASE B: targeted extension cascade (level by level)"
+echo "============================================================"
+
+for N_FROM in 12 13 14 15 16 17 18 19; do
+  N_TO=$(( N_FROM + 1 ))
+  echo ""
+  echo "=== Level n=$N_FROM -> n=$N_TO ==="
+  date
+
+  # Snapshot the seeds file so parallel jobs see a consistent view
+  SEEDS_FILE="coverage_intermediate/seeds_n${N_FROM}.json"
+  cp discoveries.json "$SEEDS_FILE"
+
+  # Generate one job per (target_d1, target_d2) at level n_to
+  JOBS_FILE=$(mktemp)
+  MAX_D1=$(( (N_TO - 1) / 2 ))
+  for D1 in $(seq 1 $MAX_D1); do
+    D2=$(( N_TO - 1 - D1 ))
+    OUT="coverage_intermediate/results_n${N_TO}_d${D1}_${D2}.json"
+    LOG="logs/coverage_n${N_FROM}_to_${N_TO}_d${D1}_${D2}.log"
+    echo "python main.py extend --n-from $N_FROM --seeds-file $SEEDS_FILE --output $OUT --coord-range 5 --target-new-exponents $D1 $D2 --loss-threshold 0.05 --n-restarts 10 2>&1 | tee $LOG" >> "$JOBS_FILE"
+  done
+
+  N_JOBS=$(wc -l < "$JOBS_FILE")
+  echo "Queuing $N_JOBS parallel targeted-extension jobs for n=$N_TO"
+
+  # Run jobs in parallel (up to 16 at a time)
+  xargs -P 16 -I {} bash -c '{}' < "$JOBS_FILE"
+  rm -f "$JOBS_FILE"
+
+  # Merge all per-target outputs back into discoveries.json (sequential, no race)
+  echo "Merging per-target results into discoveries.json..."
+  python -c "
+import json
+import glob
+from discoveries import log_discoveries
+
+all_records = []
+for f in sorted(glob.glob('coverage_intermediate/results_n${N_TO}_d*.json')):
+    try:
+        with open(f) as fh:
+            data = json.load(fh)
+        recs = data.get('arrangements', [])
+        all_records.extend(recs)
+        print(f'  loaded {len(recs)} from {f}')
+    except Exception as e:
+        print(f'  WARN: could not load {f}: {e}')
+
+n_new = log_discoveries(all_records, source='coverage', path='discoveries.json')
+print(f'Level $N_FROM -> $N_TO: merged {n_new} new discoveries (from {len(all_records)} total candidates)')
+" 2>&1 | tee "logs/merge_n${N_TO}.log"
+
+  # Cleanup intermediate files for this level
+  rm -f coverage_intermediate/results_n${N_TO}_d*.json
+  rm -f "$SEEDS_FILE"
+done
+
+# ── Final summary ───────────────────────────────────────────────────────────
+echo ""
+echo "============================================================"
+echo "Final discoveries summary"
+echo "============================================================"
+python main.py discoveries 2>&1 | tee logs/coverage_summary.log
+
+# Cleanup intermediate directory if empty
+rmdir coverage_intermediate 2>/dev/null || true
+
+echo "Job completed:" `date`
