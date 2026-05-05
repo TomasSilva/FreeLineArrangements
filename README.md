@@ -1,6 +1,60 @@
 # FreeLineArrangements
 
-Reinforcement learning system for discovering **free line arrangements** in the complex projective plane CP², using a Transformer-based actor-critic trained with PPO. Designed to run on HPC clusters with parallel environments.
+A toolkit for discovering **free line arrangements** in the complex projective plane CP². Combines a Transformer-based PPO agent with classical algebraic geometry constructions and a hybrid bootstrap-extension search. Designed to run on HPC clusters with parallel environments.
+
+## At a Glance
+
+The repo evolved through three discovery strategies, each addressing a regime where the previous one failed:
+
+| Strategy | Best for | Tool | Verified results |
+|---|---|---|---|
+| **Pure RL (PPO + Transformer)** | n ≤ 12 | `train`, `explore`, `verify-found` | 9,869 free arrangements at n=6..13 in 81h on HPC |
+| **Hybrid bootstrap extension** | n ≥ 14 | `extend` | 1,602 arrangements at n=13..18 + 1,774 at n=19 in <24h locally |
+| **Direct supersolvable construction** | All (n, d1, d2) cells | `construct` | One example per cell, instant, closed form |
+| **Δb2-targeted extension** | Filling unbalanced exponent cells | `extend --target-new-exponents` / `--all-targets` | Single n=12 supersolvable seed → 1,162 free n=13 arrangements covering all 6 exponent types |
+
+For **n ≥ 14** the recommended path is `construct --family all-supersolvable` (instant per-cell coverage) followed by `extend --all-targets` (rich non-supersolvable examples in every cell). See [Comprehensive Coverage](#comprehensive-coverage-of-all-exponent-types) below.
+
+## Quickstart
+
+If you just want to discover free line arrangements for n up to 20 with full (d1, d2) coverage, skip RL entirely:
+
+```bash
+# 1. Install
+conda create -n free_arr python=3.11 && conda activate free_arr
+pip install torch numpy sympy scipy
+
+# 2. Seed every (n, d1, d2) cell with a closed-form supersolvable example (instant)
+for N in 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  python main.py construct --family all-supersolvable --n $N
+done
+
+# 3. Cascade with targeted extension to find non-supersolvable examples (hours, not days)
+for N in 12 13 14 15 16 17 18 19; do
+  python main.py extend --n-from $N --all-targets
+done
+
+# 4. Inspect what you found
+python main.py discoveries
+```
+
+Or on HPC: `qsub pbs/step5_coverage.pbs` — single self-contained job that does steps 2 and 3 with `xargs -P 16` parallelism per level.
+
+## Empirical Results from the Cascade
+
+Local cascade (no HPC, no GPU) starting from 105 n=12 seeds produced by an earlier RL run:
+
+| n | Free arrangements found | Exponent types found | Notes |
+|---|---|---|---|
+| 13 | 1,162 (targeted) / 177 (unfiltered) | All 6 of (1,1,11)..(1,6,6) | Targeted run filled every cell |
+| 14 | 73 (unfiltered) | (1, 6, 7) only | Unfiltered drifts to balanced types |
+| 15 | 175 | (1, 7, 7) | |
+| 16 | 192 | (1, 7, 8) | |
+| 17 | 386 | (1, 7, 9) | |
+| 18 | 599 | (1, 8, 9) | |
+| 19 | 1,774 | (1, 9, 9), (1, 8, 10), (1, 7, 11) | First cascade level to find off-balanced types naturally |
+
+For comparison, the original 81-hour RL training on HPC found **9,869** free arrangements but **all** were at n ≤ 13. The hybrid extension closes the n ≥ 14 gap entirely; the targeted variant additionally fills every (d1, d2) cell.
 
 ## The Mathematical Problem
 
@@ -32,14 +86,16 @@ These are necessary (but not sufficient) conditions for freeness. The discrimina
 ## Architecture Overview
 
 ```
-main.py              CLI entry point (train, search, explore, verify, verify-found)
+main.py              CLI entry point (train, search, explore, verify, verify-found, extend, construct)
 arrangement.py       Core math: ProjectiveLine, LineArrangement, intersection lattice, exact Saito check
-saito.py             Smooth Saito loss (ALS), reward shaping, combinatorial/algebraic scores
+saito.py             Smooth Saito loss (ALS), reward shaping, polish_arrangement, extend_arrangement,
+                     extend_arrangement_targeted, construct_near_pencil, construct_supersolvable
 environment.py       Gym-like RL environment with pool and singularity-aware candidate modes
 model.py             Transformer Actor-Critic with cross-attention over candidate lines
 train.py             PPO training with adaptive triple curriculum and vectorized environments
 vec_env.py           Subprocess-based parallel environment (one worker per CPU core)
 discoveries.py       Persistent JSON log with deduplication
+pbs/                 HPC job scripts (step1_train, step2_explore, step3_verify, step4_extend, step5_coverage)
 ```
 
 ## The Loss Function
@@ -183,8 +239,10 @@ For HPC, training uses `SubprocVecEnv` with one worker process per CPU core (e.g
 ```bash
 conda create -n free_arr python=3.11
 conda activate free_arr
-pip install torch numpy sympy
+pip install torch numpy sympy scipy
 ```
+
+`scipy` is used by `polish_arrangement` (L-BFGS-B / Nelder-Mead in coefficient space) and is required for the hybrid pipeline. `torch` is only needed for the RL pipeline; the extension and construction commands work without it.
 
 ## Usage
 
@@ -255,28 +313,179 @@ For n > 12, training uses the smooth loss proxy. Verify candidates exactly with 
 python main.py verify-found --n 15 --model model_n20.pt --episodes 5000 --singularity-aware
 ```
 
+## Why Pure RL Fails Above n=13
+
+An 81-hour HPC training run with 16 parallel environments (5M PPO steps, full curriculum n=6..20, all default reward shaping) found **9,869 free arrangements at n ∈ {6, ..., 13} but ZERO at n ≥ 14**. Subsequent exploration runs (60 jobs × 5,000 episodes targeting specific (d1, d2) for n=14..20) also found nothing. Three independent root causes converge at the n=13→14 cliff:
+
+1. **Reward signal collapses for n > 12.** With `--skip-exact-above 12`, the strong `+10` exact-free terminal bonus is replaced by a graded bonus only when `algebraic_score > 0.95`. The smooth Saito loss is empirically chaotic with the default 3 ALS restarts: nearby arrangements get loss values that jump between 0 and 1 due to ALS local minima and hard SVD null-space dimension thresholds. Effectively the agent gets random reward for n>12 attempts.
+
+2. **Search space is too large for discrete RL.** For n=20 with ~200 candidates per step, the trajectory space is ≈ 200²⁰. Free arrangements form a measure-zero manifold inside this space; without a strong reward gradient, PPO is reduced to random search.
+
+3. **`smooth_saito_loss` is the wrong tool for the last mile.** It's a *signal*, not an *optimizer*. The discrete RL agent picks lines from a finite pool, but free arrangements live in a continuous parameter space — even when the agent is structurally close, every available candidate line is wrong by a small amount and there is no continuous knob to turn.
+
+The fix is to abandon "build from scratch with RL" for n ≥ 14 and instead use the next two strategies.
+
+### Bootstrap Extension (recommended for n >= 14)
+
+Take a known free arrangement, enumerate candidate lines that could extend it, pre-filter cheaply, and exact-verify the survivors. Adding **one good line** to a known free arrangement is exponentially easier than discovering a free arrangement of n+1 lines from scratch — and discoveries cascade: today's n=13 result becomes tomorrow's n=14 seed.
+
+The `extend` command implements this: it takes a seed arrangement at n_from, enumerates candidate lines from three sources (lines through pairs of existing intersection points, the small-integer pool, and optionally rational lines through multiple points), pre-filters via `smooth_saito_loss`, and exact-verifies the survivors with sympy. **Empirical result**: starting from existing n=12 seeds (105 arrangements), a local cascade in under 24 hours produced 1,602 free arrangements at n=13..18 and 1,774 more at n=19, covering ground that the 81-hour RL training never reached.
+
+```bash
+# Extend known n=12 arrangements to find n=13 free arrangements
+python main.py extend --n-from 12 --seeds-file discoveries.json
+
+# Cascade: each step uses the previous step's discoveries as seeds
+for N in 12 13 14 15 16 17 18 19; do
+  python main.py extend --n-from $N --seeds-file discoveries.json
+done
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--n-from` | required | Source n: load free arrangements with this n as seeds |
+| `--seeds-file` | discoveries.json | Input JSON with seed arrangements |
+| `--output` | same as seeds | Where to save new discoveries |
+| `--coord-range` | 5 | Integer pool range for new candidate lines |
+| `--max-denominator` | 1 | If >1, also generate rational lines through existing multiple points |
+| `--loss-threshold` | 0.05 | Pre-filter: skip exact check if smooth loss above this |
+| `--n-restarts` | 10 | ALS restarts in the smooth loss pre-filter |
+| `--max-seeds` | None | Limit seeds (for testing) |
+| `--target-exponents` | None | Filter seeds by their exponents |
+| `--target-new-exponents` | None | Target a specific (d1, d2) for the n+1 result. Uses Δb2 pre-filter. |
+| `--all-targets` | off | Iterate over ALL valid (d1, d2) types for n+1. Comprehensive coverage. |
+
+This enumerate-and-verify approach is what enables discovery of arrangements with n >= 14 in this codebase. The cascading structure means a few hundred n=12 seeds can grow into thousands of arrangements at higher n values.
+
+### Comprehensive Coverage of All Exponent Types
+
+The unfiltered `extend` cascade tends to drift toward "balanced" exponent types: starting from n=12 seeds, the local cascade finds (1, 6, 6) at n=13, (1, 6, 7) at n=14, (1, 7, 7) at n=15, etc., while the unbalanced types (1, 1, n-2), (1, 2, n-3), ... never appear. The reason is geometric: "structural" candidate lines (those passing through several existing intersection points) decrease Δb2, and the algorithm's `_singularity_candidates` enumerator never produces lines that pass through few or zero existing points. To get **comprehensive coverage** — at least one example per (n, d1, d2) cell, including the near-pencil tail — combine two complementary tools.
+
+**1. Direct construction** (`construct` command). Closed-form constructions of known free arrangement families. No search, no optimization — just emit the arrangement and save it. Provides one supersolvable example per cell instantly.
+
+```bash
+# Near-pencil: free with exponents (1, 1, n-2). Single function call.
+python main.py construct --family near-pencil --n 20
+
+# Supersolvable: free with exponents (1, d1, n-1-d1) for any d1 in [1, (n-1)//2].
+# Construction: two pencils sharing one common line. The smaller pencil contributes
+# the d1 exponent; by Terao's supersolvability theorem the result is free.
+python main.py construct --family supersolvable --n 20 --d1 5
+
+# All-supersolvable: emit one supersolvable for EVERY valid (d1, d2) at level n.
+# Single command to fill the entire row of the (n, d1, d2) coverage table.
+python main.py construct --family all-supersolvable --n 20
+```
+
+The supersolvable construction is implemented in `construct_supersolvable(n, d1)` ([saito.py](saito.py)). Two pencils centered at [0:0:1] and [0:1:0] share the common line `x = 0`; the first pencil contributes (d1+1) lines and the second contributes (n-d1) lines. Verified to produce exactly the right exponents `(1, d1, n-1-d1)` for every valid (n, d1) pair tested up to n=20.
+
+**2. Targeted extension** (`extend --target-new-exponents D1 D2`). Uses the **Δb2 pre-filter** to efficiently search for non-supersolvable examples in a specific cell. Much faster than the unfiltered cascade because most candidates are rejected by an integer comparison before any algebraic work.
+
+The Δb2 formula: for a candidate line L added to seed arrangement A of n lines, let `S(L, A)` be the sum of multiplicities of existing intersection points L passes through and `k(L, A)` be the number of distinct such points. Then exactly:
+```
+Δb2 = n + k - S
+```
+(derivation: L meets each of n existing lines somewhere; S of those meetings reuse existing points (each bumping a multiplicity by 1, contributing +1 to b2 per distinct point), the other n−S create brand-new simple points). For a target exponent (d1', d2') at level n+1, the required `Δb2 = (n + d1'·d2') − b2_seed`. This must lie in `[1, n+1]` to be achievable; outside that range the targeted extension exits in 0 ms with no candidates considered.
+
+```bash
+# Find all n=14 arrangements of type (1, 3, 10) starting from n=13 seeds
+python main.py extend --n-from 13 --target-new-exponents 3 10
+
+# Iterate over all 6 target types for n=14 — comprehensive coverage in one command
+python main.py extend --n-from 13 --all-targets
+```
+
+**Empirical result.** Starting from just 5 supersolvable seeds at n=12 (one per exponent type), the targeted extension found **1,162 free n=13 arrangements covering all 6 exponent types**:
+
+| Type | Count | Notes |
+|---|---|---|
+| (1, 1, 11) | 28 | near-pencil |
+| (1, 2, 10) | 797 | most numerous |
+| (1, 3, 9) | 131 | |
+| (1, 4, 8) | 91 | |
+| (1, 5, 7) | 75 | |
+| (1, 6, 6) | 36 | balanced |
+
+Compare this to the original unfiltered cascade, which only ever found (1, 5, 7) and (1, 6, 6) at n=13 — the four unbalanced types were completely missing. All 8 spot-checked unbalanced discoveries verified exactly free with sympy.
+
+**Recommended workflow** for filling the entire (n, d1, d2) coverage table for n up to 20:
+
+```bash
+# PHASE A: instant per-cell supersolvable seeds
+for N in 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  python main.py construct --family all-supersolvable --n $N
+done
+
+# PHASE B: cascade with targeted extension to find non-supersolvable examples
+for N in 12 13 14 15 16 17 18 19; do
+  python main.py extend --n-from $N --all-targets
+done
+```
+
+The supersolvable arrangements from phase A are very symmetric (they have a modular line of high multiplicity, so their multiplicity profiles are dominated by one large point); phase B finds richer combinatorial types in adjacent cells. For HPC, use `pbs/step5_coverage.pbs` which parallelizes phase B across the (n_from, d1, d2) cells using xargs -P 16 with race-free intermediate files.
+
 ### View Discoveries
 
 ```bash
 python main.py discoveries
 ```
 
+### Visualize an Arrangement
+
+[visualize_new.ipynb](visualize_new.ipynb) plots a line arrangement in the affine chart `z = 1`. Each projective line `ax + by + cz = 0` becomes `ax + by + c = 0` in this chart. The single exception is the line at infinity `z = 0` (i.e., a line with `(a, b) = (0, 0)` after projective normalization), which is rendered as a dotted boundary circle. Intersection points are marked with marker size scaled by multiplicity. Pairs of parallel affine lines correctly do NOT show an affine intersection — their common point lies at infinity.
+
+```python
+from visualize_new import draw_arrangement   # or open the notebook directly
+draw_arrangement([
+    "(1x+0y+0z=0)",   # x = 0
+    "(0x+1y+0z=0)",   # y = 0
+    "(1x+1y+-1z=0)",  # x + y = 1
+    "(0x+0y+1z=0)",   # line at infinity z = 0
+], xlim=(-2, 2), ylim=(-2, 2))
+```
+
 ## HPC Deployment
 
-PBS job scripts are in `pbs/`:
+PBS job scripts are in `pbs/`. They fall into two pipelines:
+
+**Pipeline A — RL training and exploration** (worked for n ≤ 13 only):
 
 | Script | Purpose |
 |---|---|
-| `step1_train.pbs` | Curriculum training n=6 to 20 with 16 parallel environments |
-| `step2_explore.pbs` | Parallel exponent-targeted exploration (all (d1, d2) pairs per n) |
-| `step3_verify.pbs` | Parallel exact Saito verification per exponent type |
+| `step1_train.pbs` | PPO curriculum training n=6 to 20, 16 parallel environments, ~80h runtime |
+| `step2_explore.pbs` | Parallel exponent-targeted greedy rollouts of the trained model (all (d1, d2) cells) |
+| `step3_verify.pbs` | Parallel post-hoc exact sympy verification of model-found candidates |
 
-Steps 2 and 3 run up to 16 jobs in parallel via `xargs -P 16`, each targeting a specific exponent type with `--target-exponents D1 D2`. All scripts use `PYTHONUNBUFFERED=1` for real-time log monitoring:
+**Pipeline B — Hybrid extension and direct construction** (works for ALL n):
+
+| Script | Purpose |
+|---|---|
+| `step4_extend.pbs` | Sequential cascade extension n=12 → 20 (unfiltered; finds balanced types) |
+| `step5_coverage.pbs` | Comprehensive coverage: phase A constructs one supersolvable per (n, d1, d2) cell sequentially; phase B runs targeted Δb2 extension in parallel for every cell, level by level, with race-free intermediate files |
+
+**Recommended HPC workflow** for new runs (skip the slow training entirely):
 
 ```bash
-tail -f logs/train.log           # monitor training
-tail -f logs/explore_*.log       # monitor exploration
-tail -f logs/verify_*.log        # monitor verification
+qsub pbs/step5_coverage.pbs    # ~24-72h: complete coverage table for n=6..20
+```
+
+If you want to also collect the unfiltered cascade discoveries (which produce many balanced examples per cell):
+
+```bash
+qsub pbs/step5_coverage.pbs    # first
+qsub pbs/step4_extend.pbs      # then, using step5's discoveries.json as input
+```
+
+Race-condition safety in `step5_coverage.pbs`: parallel jobs at each level only **read** from a frozen snapshot `coverage_intermediate/seeds_n${N_FROM}.json` and **write** to disjoint per-target output files `coverage_intermediate/results_n${N_TO}_d${D1}_${D2}.json`. After each level completes, a sequential merge step calls `log_discoveries` (which deduplicates by canonical key) to fold the results into the central `discoveries.json` before moving to the next level.
+
+All scripts use `PYTHONUNBUFFERED=1` for real-time log monitoring:
+
+```bash
+tail -f logs/train.log              # monitor training
+tail -f logs/explore_*.log          # monitor RL exploration
+tail -f logs/verify_*.log           # monitor RL verification
+tail -f logs/coverage_n*.log        # monitor targeted-extension coverage jobs
+tail -f logs/extend_n*.log          # monitor unfiltered cascade
 ```
 
 ## Key Invariants

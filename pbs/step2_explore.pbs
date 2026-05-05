@@ -2,7 +2,7 @@
 #PBS -N free_arr_explore
 #PBS -q par16
 #PBS -l nodes=1:ppn=16
-#PBS -l walltime=48:00:00
+#PBS -l walltime=240:00:00
 #PBS -e logs/explore.err
 #PBS -o logs/explore.out
 #PBS -m abe
