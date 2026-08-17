@@ -208,3 +208,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# live discovery log (139MB+; exceeds GitHub blob limit as it grows)
+discoveries.json
+# archived legacy corpora
+legacy_corpora_*.tar.gz
+.DS_Store
