@@ -44,7 +44,7 @@ for N_FROM in 12 13 14 15 16 17 18 19; do
     --output discoveries.json \
     --coord-range 5 \
     --max-denominator 1 \
-    --loss-threshold 0.05 \
+    --loss-threshold 1e-6 \
     --n-restarts 10 \
     2>&1 | tee "logs/extend_n${N_FROM}_to_${N_TO}.log"
 done

@@ -85,7 +85,7 @@ for N_FROM in 12 13 14 15 16 17 18 19; do
     D2=$(( N_TO - 1 - D1 ))
     OUT="coverage_intermediate/results_n${N_TO}_d${D1}_${D2}.json"
     LOG="logs/coverage_n${N_FROM}_to_${N_TO}_d${D1}_${D2}.log"
-    echo "python main.py extend --n-from $N_FROM --seeds-file $SEEDS_FILE --output $OUT --coord-range 5 --target-new-exponents $D1 $D2 --loss-threshold 0.05 --n-restarts 10 2>&1 | tee $LOG" >> "$JOBS_FILE"
+    echo "python main.py extend --n-from $N_FROM --seeds-file $SEEDS_FILE --output $OUT --coord-range 5 --target-new-exponents $D1 $D2 --loss-threshold 1e-6 --n-restarts 10 2>&1 | tee $LOG" >> "$JOBS_FILE"
   done
 
   N_JOBS=$(wc -l < "$JOBS_FILE")

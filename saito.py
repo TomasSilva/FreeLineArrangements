@@ -1,19 +1,36 @@
 """
 saito.py
 
-Continuous Saito loss / reward shaping for the RL agent.
+Saito loss / reward shaping for the RL agent.
 
 Three levels of signal:
   1. Combinatorial: Does b2(A) give integer candidate exponents?
      disc = (n-1)^2 - 4*(b2-(n-1)) must be >= 0 and a perfect square.
 
-  2. Algebraic (smooth): For candidate exponents (d1, d2), search over the
-     full null spaces ker(M_d1), ker(M_d2) to find derivations theta1, theta2
-     minimizing ||det(Euler, theta1, theta2) - c*Q||^2 / ||Q||^2.
-     Solved via Alternating Least Squares in coefficient space.
+  2. Algebraic (penalized): the corrected penalized Saito functional
+     (penalized_saito.py).  For a degree pair (d1, d2) with d1+d2 = n-1 it
+     maximizes
+         Gamma(u, v) = |<B(u,v), q>|^2 / (||B(u,v)||^2 + lambda*R(u,v)^beta)
+     over unit u, v in the FULL coefficient spaces E_d1, E_d2, where
+     R(u, v) = ||L_{A,d1} u||^2 + ||L_{A,d2} v||^2 penalizes violation of the
+     logarithmic tangency conditions (Bombieri-Weyl norms throughout).
+     The loss 1 - Gamma_hat is a bounded, coordinate-normalized, upper-
+     semicontinuous search signal: 0 exactly on free arrangements, strictly
+     inside (0, 1) on nonfree ones.  It is an upper bound on the ideal loss
+     and is never a freeness certificate.
 
   3. Algebraic (hard): Does a Saito basis exist?
-     (Only used for exact verification at episode end.)
+     Exact symbolic verification over Q (arrangement.is_free); the only
+     accepted certificate of freeness.
+
+HISTORICAL NOTE (old angular score).  The former "smooth Saito loss"
+(ALS angle over SVD null-space bases) is mathematically binary in exact
+arithmetic: for exact logarithmic derivations of candidate degrees, the Saito
+determinant is always a scalar multiple of Q, so the exact angular score is
+0 (free) or 1 (nonfree) and intermediate floating-point values only measured
+numerical violation of logarithmicity and SVD tolerances.  It is retained
+verbatim as `legacy_invalid_angular_score` strictly for regression
+comparisons and MUST NOT be used as a proximity measure or reward.
 
 The reward function R(A) returned to the RL agent is:
   R(A) = w_comb * score_comb(A)
@@ -24,10 +41,19 @@ The reward function R(A) returned to the RL agent is:
 where each score is in [-1, 1].
 """
 
+import warnings
+
 import numpy as np
 import sympy as sp
 from sympy import Rational, Matrix
 from arrangement import LineArrangement, ProjectiveLine
+from penalized_saito import (
+    penalized_saito_loss,
+    penalized_saito_loss_all_pairs,
+    cached_penalized_loss,
+    DEFAULT_LAMBDA,
+    DEFAULT_BETA,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,7 +270,8 @@ def _compute_Q_coefficients(arr):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _null_space_basis(M, tol=1e-10, min_extra=0):
-    """Compute orthonormal basis for ker(M) via SVD.
+    """LEGACY (used only by legacy_invalid_angular_score).
+    Compute orthonormal basis for ker(M) via SVD.
 
     Args:
         M: (rows, cols) matrix
@@ -282,7 +309,8 @@ def _null_space_basis(M, tol=1e-10, min_extra=0):
 
 
 def _build_det_tensor(V2, V3, d1, d2, n):
-    """Precompute bilinear tensor T mapping (alpha2, alpha3) -> det coefficients.
+    """LEGACY (used only by legacy_invalid_angular_score).
+    Precompute bilinear tensor T mapping (alpha2, alpha3) -> det coefficients.
 
     det(Euler, theta1, theta2) = x*(g2*h3 - g3*h2) - y*(f2*h3 - f3*h2) + z*(f2*g3 - f3*g2)
 
@@ -374,7 +402,8 @@ def _build_det_tensor(V2, V3, d1, d2, n):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _als_minimize(T, q, n_iters=10, n_restarts=3, rng=None):
-    """Minimize ||D(alpha2, alpha3) - c*q||^2 / ||q||^2 via ALS.
+    """LEGACY (used only by legacy_invalid_angular_score).
+    Minimize ||D(alpha2, alpha3) - c*q||^2 / ||q||^2 via ALS.
 
     D_j = sum_{ik} T[j,i,k] * alpha2[i] * alpha3[k]  (bilinear)
 
@@ -459,28 +488,84 @@ def _als_minimize(T, q, n_iters=10, n_restarts=3, rng=None):
     return best_loss, best_a2, best_a3
 
 
-def smooth_saito_loss(arr, target_exponents=None, n_restarts=10, n_iters=10,
-                      min_extra=0):
-    """Compute smooth Saito loss for a line arrangement.
+def saito_loss(arr, target_exponents=None, lam=DEFAULT_LAMBDA,
+               beta=DEFAULT_BETA, profile='search', n_restarts=None,
+               seed=0, cached=False):
+    """Production Saito loss: the corrected penalized functional.
 
-    Searches over the full null spaces ker(M_d1), ker(M_d2) to find
-    derivations theta1, theta2 minimizing:
-        ||det(Euler, theta1, theta2) - c*Q||^2 / ||Q||^2
+    Thin wrapper around penalized_saito.penalized_saito_loss.  If
+    target_exponents is None, candidate exponents are used when they exist and
+    the all-pairs envelope otherwise (the loss is defined for EVERY degree
+    pair with d1 + d2 = n - 1; candidate arithmetic never gates it).
+
+    Returns a loss in [0, 1]: ~0 on free arrangements (for the correct
+    exponents), strictly inside (0, 1) on nonfree ones.  The value is a
+    numerical upper bound on the ideal loss — a search signal, never a
+    freeness or nonfreeness certificate.  Use verify_arrangement / is_free
+    for exact certification.
+    """
+    if target_exponents is not None:
+        d1, d2 = target_exponents
+        n = len(arr)
+        if d1 + d2 != n - 1:
+            # Degrees only make sense at the target size; during growth the
+            # callers use combinatorial signals instead.
+            return 1.0
+    else:
+        d1 = d2 = None
+    if cached and isinstance(arr, LineArrangement):
+        return cached_penalized_loss(arr, d1=d1, d2=d2, lam=lam, beta=beta,
+                                     profile=profile, seed=seed)
+    return penalized_saito_loss(arr, d1=d1, d2=d2, lam=lam, beta=beta,
+                                profile=profile, n_restarts=n_restarts,
+                                seed=seed)
+
+
+def smooth_saito_loss(arr, target_exponents=None, n_restarts=None, n_iters=None,
+                      min_extra=None):
+    """DEPRECATED alias: now computes the corrected penalized Saito loss.
+
+    The old ALS angular score this name used to compute is mathematically
+    binary in exact arithmetic (see module docstring) and survives only as
+    `legacy_invalid_angular_score` for regression comparisons.  The
+    n_iters / min_extra arguments of the old implementation are ignored.
+    """
+    warnings.warn(
+        "smooth_saito_loss is deprecated: it now computes the corrected "
+        "penalized Saito loss (penalized_saito.py). The old ALS angular "
+        "score is available as legacy_invalid_angular_score and is invalid "
+        "as a proximity measure.", DeprecationWarning, stacklevel=2)
+    return saito_loss(arr, target_exponents=target_exponents,
+                      n_restarts=n_restarts)
+
+
+def legacy_invalid_angular_score(arr, target_exponents=None, n_restarts=10,
+                                 n_iters=10, min_extra=0):
+    """LEGACY, MATHEMATICALLY INVALID as a proximity measure — regression only.
+
+    This is the old "smooth Saito loss": the ALS angle between Saito
+    determinants and Q evaluated over SVD null-space bases of the derivation
+    matrices.  In exact arithmetic this quantity is BINARY: for exact
+    logarithmic derivations u, v with deg u + deg v = n - 1, every alpha_i
+    divides det M(theta_E, u, v) and the degrees match deg Q, so the
+    determinant is c*Q (c = 0 unless the arrangement is free).  The exact
+    score is therefore 0 on free and 1 on nonfree arrangements; the
+    intermediate values this float implementation returns measure SVD
+    tolerances, conditioning, and rounding — not proximity to freeness.
+    Kept verbatim (including its tolerance-dependent behavior) so that old
+    experiments can be reproduced and compared.  Do not use in production.
 
     Args:
         arr: LineArrangement
         target_exponents: optional (d1, d2) tuple. If provided, use these
             exponents instead of deriving from the arrangement's b2.
-        n_restarts: number of random restarts for ALS (default 10). Higher values
-            give a more reliable loss at the cost of speed. Use 30-50 for the polish
-            step where reliability matters more than speed.
+        n_restarts: number of random restarts for ALS (default 10).
         n_iters: number of ALS iterations per restart (default 10).
         min_extra: number of "near-null" singular vectors to include beyond the
-            strict null space. Default 0 (use only true null space). Use 5-15 in
-            polish_arrangement to make the loss continuous near the free point.
+            strict null space (NOT true derivations when > 0).
 
     Returns:
-        loss: float in [0, 1], where 0 = free arrangement, 1 = far from free
+        float in [0, 1]; exact-arithmetic value would be binary {0, 1}.
     """
     n = len(arr)
     if n < 3:
@@ -525,20 +610,24 @@ def smooth_saito_loss(arr, target_exponents=None, n_restarts=10, n_iters=10,
     return float(np.clip(loss, 0.0, 1.0))
 
 
-def algebraic_score(arr: LineArrangement, target_exponents=None) -> float:
+def algebraic_score(arr: LineArrangement, target_exponents=None,
+                    use_legacy: bool = False) -> float:
     """
-    Continuous score in [-1, 1] measuring progress toward freeness.
+    Score in [-1, 1] measuring progress toward freeness.
 
     Two-tier design:
       Tier 1 ([-1, 0]): discriminant proximity — how close is b2 to producing
         the target exponents?  Cheap arithmetic, always computable.
-      Tier 2 ([0, 1]): smooth Saito loss — searches over full null spaces via
-        ALS to find optimal derivations minimizing ||det - c*Q||/||Q||.
+      Tier 2 ([0, 1]): 1 - penalized Saito loss = Gamma_hat, the corrected
+        bounded upper-semicontinuous signal (penalized_saito.py).
 
     Args:
         arr: LineArrangement
         target_exponents: optional (d1, d2) tuple. If provided, Tier 1 measures
             distance from current b2 to target_b2 = (n-1) + d1*d2.
+        use_legacy: if True, Tier 2 uses legacy_invalid_angular_score instead
+            of the corrected loss.  ONLY for the explicitly-invalid regression
+            baseline; never in production.
 
     Score landscape:
       [-1.0]       product < 0 (b2 too small for any exponents)
@@ -566,7 +655,12 @@ def algebraic_score(arr: LineArrangement, target_exponents=None) -> float:
             return -distance  # in [-1, 0)
         # b2 matches target — Tier 2 only when arrangement is at target size
         if n == target_n:
-            loss = smooth_saito_loss(arr, target_exponents=target_exponents)
+            if use_legacy:
+                loss = legacy_invalid_angular_score(
+                    arr, target_exponents=target_exponents)
+            else:
+                loss = saito_loss(arr, target_exponents=target_exponents,
+                                  profile='rl', cached=True)
             return 1.0 - loss
         else:
             # Dense positive signal during growth: reward progress toward target size
@@ -595,9 +689,12 @@ def algebraic_score(arr: LineArrangement, target_exponents=None) -> float:
         if (n - 1 - sq) % 2 != 0 or (n - 1 - sq) < 0:
             return -0.01
 
-        # ── Tier 2: smooth Saito loss → [0, 1] ──────────────────────────────
+        # ── Tier 2: penalized Saito loss → [0, 1] ───────────────────────────
 
-        loss = smooth_saito_loss(arr)
+        if use_legacy:
+            loss = legacy_invalid_angular_score(arr)
+        else:
+            loss = saito_loss(arr, profile='rl', cached=True)
         return 1.0 - loss  # 0 = far from free, 1 = exactly free
 
 
@@ -731,6 +828,8 @@ def saito_reward(
     terminal_only_free_bonus: bool = True,
     skip_exact_above: int = 12,
     target_exponents=None,
+    use_legacy: bool = False,
+    terminal_alg_bonus: bool = True,
 ) -> float:
     """
     Compute shaped reward for the RL agent.
@@ -769,10 +868,13 @@ def saito_reward(
     # Combinatorial score
     reward += w_comb * combinatorial_score(arr)
 
-    # Algebraic score
+    # Algebraic score (skip entirely at zero weight: avoids paying for the
+    # loss evaluation and keeps score-free reward arms from warming the
+    # shared loss cache)
     n = len(arr)
-    if n >= 3:
-        reward += w_alg * algebraic_score(arr, target_exponents=target_exponents)
+    if n >= 3 and w_alg != 0.0:
+        reward += w_alg * algebraic_score(arr, target_exponents=target_exponents,
+                                          use_legacy=use_legacy)
 
     # Interestingness bonus (rich singularity structure)
     if n >= 3:
@@ -809,9 +911,13 @@ def saito_reward(
                 is_free, _ = arr.is_free()
                 if is_free:
                     reward += w_free
-            else:
-                # Large n: give stronger partial bonus based on algebraic score
-                alg = algebraic_score(arr, target_exponents=target_exponents)
+            elif terminal_alg_bonus:
+                # Large n: give stronger partial bonus based on algebraic
+                # score.  Disabled (terminal_alg_bonus=False) in score-free
+                # reward arms so no algebraic signal leaks through the
+                # terminal branch.
+                alg = algebraic_score(arr, target_exponents=target_exponents,
+                                      use_legacy=use_legacy)
                 if alg > 0.95:
                     reward += w_free * 0.8 * ((alg - 0.95) / 0.05)
                 elif alg > 0.80:
@@ -951,9 +1057,12 @@ def polish_arrangement(
         if candidate is None:
             return 1.0
         try:
-            return smooth_saito_loss(candidate, target_exponents=target_exponents,
-                                     n_restarts=n_restarts_loss,
-                                     min_extra=min_extra)
+            # Penalized loss is defined off the free stratum (no null-space
+            # dimension jumps), so the old min_extra continuity hack is
+            # unnecessary; min_extra is accepted for signature compatibility
+            # and ignored.
+            return saito_loss(candidate, target_exponents=target_exponents,
+                              profile='search', n_restarts=n_restarts_loss)
         except Exception:
             return 1.0
 
@@ -1166,7 +1275,7 @@ def _enumerate_extension_candidates(arr, coord_range=5, include_singularity=True
 def extend_arrangement(
     seed_arr: LineArrangement,
     coord_range: int = 5,
-    loss_threshold: float = 0.05,
+    loss_threshold: float = 1e-6,
     n_restarts: int = 10,
     max_denominator: int = 1,
     verbose: bool = False,
@@ -1177,19 +1286,20 @@ def extend_arrangement(
     For each candidate line L (from singularity + small-integer pool):
         1. Build new_arr = seed_arr + [L]
         2. Quick reject: skip if new_arr.candidate_exponents() is None
-        3. Pre-filter: skip if smooth_saito_loss(new_arr) > loss_threshold
+        3. Pre-filter: skip if the penalized Saito loss > loss_threshold
         4. Verify exactly via new_arr.is_free()
         5. If free, record it.
 
     Args:
         seed_arr: known free arrangement to extend.
         coord_range: integer pool range for the new line.
-        loss_threshold: pre-filter threshold (skip exact check if loss above this).
-            Lower values are faster but may miss valid extensions; 0.05 is a good
-            starting point.
-        n_restarts: ALS restarts in the loss pre-filter (default 10).
+        loss_threshold: pre-filter threshold (skip exact check if loss above
+            this).  The default was refit on a validation benchmark for the
+            penalized loss (see results_penalized_saito/); lower values are
+            faster but may miss valid extensions.
+        n_restarts: optimizer restarts in the loss pre-filter (default 10).
         verbose: print per-candidate diagnostics.
-        target_exponents: optional (d1, d2) override for the smooth loss filter.
+        target_exponents: optional (d1, d2) override for the loss filter.
 
     Returns:
         List of dicts, one per successful extension:
@@ -1219,9 +1329,10 @@ def extend_arrangement(
 
         tgt = target_exponents if target_exponents is not None else cand_exps
 
-        # Smooth loss pre-filter
+        # Penalized loss pre-filter
         try:
-            loss = smooth_saito_loss(new_arr, target_exponents=tgt, n_restarts=n_restarts)
+            loss = saito_loss(new_arr, target_exponents=tgt,
+                              profile='search', n_restarts=n_restarts)
         except Exception:
             continue
         if loss > loss_threshold:
@@ -1292,7 +1403,7 @@ def extend_arrangement_targeted(
     seed_arr: LineArrangement,
     target_exponents,
     coord_range: int = 5,
-    loss_threshold: float = 0.05,
+    loss_threshold: float = 1e-6,
     n_restarts: int = 10,
     max_denominator: int = 1,
     verbose: bool = False,
@@ -1379,10 +1490,10 @@ def extend_arrangement_targeted(
         if cand_exps is None or cand_exps != target_exponents:
             continue
 
-        # Smooth loss pre-filter
+        # Penalized loss pre-filter
         try:
-            loss = smooth_saito_loss(new_arr, target_exponents=target_exponents,
-                                     n_restarts=n_restarts)
+            loss = saito_loss(new_arr, target_exponents=target_exponents,
+                              profile='search', n_restarts=n_restarts)
         except Exception:
             continue
         if loss > loss_threshold:

@@ -63,8 +63,18 @@ class TransformerActorCritic(nn.Module):
         n_heads: int = 4,
         n_layers: int = 3,
         scalar_dim: int = 17,
+        mode: str = "add",
     ):
+        """mode='add': grow-one-line action space (one logit per candidate).
+        mode='swap_joint': fixed-cardinality replacement actions — joint
+        logits over (removal slot i, candidate j) flattened to max_n * P,
+        factored as remove_score_i + add_score_j (an unconditioned factored
+        policy; keeps the PPO plumbing single-Categorical).  All parameters
+        of 'add' mode are preserved, so old checkpoints load with
+        strict=False."""
         super().__init__()
+        assert mode in ("add", "swap_joint")
+        self.mode = mode
         self.max_n = max_n
         self.d_model = d_model
         self.scalar_dim = scalar_dim
@@ -97,6 +107,12 @@ class TransformerActorCritic(nn.Module):
 
         # Actor: per-candidate score
         self.actor_head = nn.Linear(d_model, 1)
+
+        # Swap mode: per-selected-line removal score (additive head; unused
+        # in 'add' mode so old checkpoints stay loadable)
+        self.remove_head = nn.Linear(d_model, 1)
+        nn.init.orthogonal_(self.remove_head.weight, gain=0.01)
+        nn.init.constant_(self.remove_head.bias, 0.0)
 
         # Critic: global summary -> value
         self.critic_head = nn.Sequential(
@@ -156,8 +172,18 @@ class TransformerActorCritic(nn.Module):
         )  # (B, pool_size, d_model)
 
         # ── Actor logits ──────────────────────────────────────────────────────
-        logits = self.actor_head(cand_ctx).squeeze(-1)  # (B, pool_size)
-        logits = logits + (1.0 - mask) * (-1e9)
+        cand_scores = self.actor_head(cand_ctx).squeeze(-1)  # (B, pool_size)
+        if self.mode == "swap_joint":
+            # joint (removal slot, candidate) logits, flattened row-major to
+            # match SwapArrangementEnv's a = i * pool_size + j convention;
+            # `mask` is already the flattened joint mask (B, max_n*pool_size)
+            remove_scores = self.remove_head(context[:, 1:, :]).squeeze(-1)
+            # (B, max_n); padded slots are masked by the joint mask
+            joint = remove_scores.unsqueeze(2) + cand_scores.unsqueeze(1)
+            logits = joint.reshape(B, -1)
+            logits = logits + (1.0 - mask) * (-1e9)
+        else:
+            logits = cand_scores + (1.0 - mask) * (-1e9)
 
         # ── Critic value ──────────────────────────────────────────────────────
         # Use the scalar summary token as the global state representation

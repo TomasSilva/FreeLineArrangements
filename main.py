@@ -283,8 +283,8 @@ def run_extend(args):
       - Small-integer pool (a, b, c) in [-coord_range, coord_range]
       - Optionally rational lines through existing multiple points
 
-    Each candidate is pre-filtered by `smooth_saito_loss` (fast) before the
-    expensive exact `is_free()` check.
+    Each candidate is pre-filtered by the penalized Saito loss (saito_loss)
+    before the expensive exact `is_free()` check.
     """
     import json
     import time
@@ -625,10 +625,13 @@ def main():
                             help='Integer pool coordinate range for new lines')
     ext_parser.add_argument('--max-denominator', type=int, default=1,
                             help='If >1, also generate rational lines through existing multiple points')
-    ext_parser.add_argument('--loss-threshold', type=float, default=0.05,
-                            help='Pre-filter: skip exact check if smooth loss above this')
+    ext_parser.add_argument('--loss-threshold', type=float, default=1e-6,
+                            help='Pre-filter: skip exact check if penalized '
+                                 'Saito loss above this (refit on the '
+                                 'validation benchmark)')
     ext_parser.add_argument('--n-restarts', type=int, default=10,
-                            help='ALS restarts in the smooth loss pre-filter')
+                            help='Optimizer restarts in the penalized loss '
+                                 'pre-filter')
     ext_parser.add_argument('--max-seeds', type=int, default=None,
                             help='Limit number of seeds to process (for testing)')
     ext_parser.add_argument('--target-exponents', type=int, nargs=2, default=None,

@@ -2,14 +2,26 @@
 
 A toolkit for discovering **free line arrangements** in the complex projective plane CP². Combines a Transformer-based PPO agent with classical algebraic geometry constructions and a hybrid bootstrap-extension search. Designed to run on HPC clusters with parallel environments.
 
+> **2026-08 migration note.** The numerical search signal was replaced: the old
+> "smooth Saito loss" (angular ALS score over SVD null spaces) is mathematically
+> binary in exact arithmetic and has been retired to
+> `saito.legacy_invalid_angular_score` (regression comparisons only). Production
+> code now uses the **penalized Saito loss** (`penalized_saito.py`) — a bounded,
+> coordinate-normalized, upper-semicontinuous loss with a tangency-residual
+> penalty. Every freeness claim is (and always was) backed by an exact symbolic
+> Saito certificate, so the discovery counts below stand; timing/threshold/
+> reward-signal claims tied to the old score are marked historical. See
+> `results_penalized_saito/` for the migration report, validation study, and
+> rerun experiments.
+
 ## At a Glance
 
-The repo evolved through three discovery strategies, each addressing a regime where the previous one failed:
+The repo evolved through three discovery strategies, each addressing a regime where the previous one failed. Result counts are exact-certified discoveries; rows marked *historical* were produced with the old angular pre-filter/reward (their certificates remain valid):
 
 | Strategy | Best for | Tool | Verified results |
 |---|---|---|---|
-| **Pure RL (PPO + Transformer)** | n ≤ 12 | `train`, `explore`, `verify-found` | 9,869 free arrangements at n=6..13 in 81h on HPC |
-| **Hybrid bootstrap extension** | n ≥ 14 | `extend` | 1,602 arrangements at n=13..18 + 1,774 at n=19 in <24h locally |
+| **Pure RL (PPO + Transformer)** | n ≤ 12 | `train`, `explore`, `verify-found` | 9,869 free arrangements at n=6..13 in 81h on HPC (*historical*: old reward signal) |
+| **Hybrid bootstrap extension** | n ≥ 14 | `extend` | 1,602 arrangements at n=13..18 + 1,774 at n=19 in <24h locally (*historical*: old 0.05 angular pre-filter) |
 | **Direct supersolvable construction** | All (n, d1, d2) cells | `construct` | One example per cell, instant, closed form |
 | **Δb2-targeted extension** | Filling unbalanced exponent cells | `extend --target-new-exponents` / `--all-targets` | Single n=12 supersolvable seed → 1,162 free n=13 arrangements covering all 6 exponent types |
 
@@ -54,7 +66,7 @@ Local cascade (no HPC, no GPU) starting from 105 n=12 seeds produced by an earli
 | 18 | 599 | (1, 8, 9) | |
 | 19 | 1,774 | (1, 9, 9), (1, 8, 10), (1, 7, 11) | First cascade level to find off-balanced types naturally |
 
-For comparison, the original 81-hour RL training on HPC found **9,869** free arrangements but **all** were at n ≤ 13. The hybrid extension closes the n ≥ 14 gap entirely; the targeted variant additionally fills every (d1, d2) cell.
+For comparison, the original 81-hour RL training on HPC found **9,869** free arrangements but **all** were at n ≤ 13. The hybrid extension closes the n ≥ 14 gap entirely; the targeted variant additionally fills every (d1, d2) cell. (These counts predate the loss migration; each arrangement is exact-certified, so the counts stand, but the timing and filter behavior reflect the retired angular score. The corrected-loss reruns are in `results_penalized_saito/`.)
 
 ## The Mathematical Problem
 
@@ -88,8 +100,16 @@ These are necessary (but not sufficient) conditions for freeness. The discrimina
 ```
 main.py              CLI entry point (train, search, explore, verify, verify-found, extend, construct)
 arrangement.py       Core math: ProjectiveLine, LineArrangement, intersection lattice, exact Saito check
-saito.py             Smooth Saito loss (ALS), reward shaping, polish_arrangement, extend_arrangement,
-                     extend_arrangement_targeted, construct_near_pencil, construct_supersolvable
+saito.py             Reward shaping on the penalized Saito loss, polish_arrangement, extend_arrangement,
+                     extend_arrangement_targeted, construct_near_pencil, construct_supersolvable,
+                     legacy_invalid_angular_score (retired ALS score, regression only)
+penalized_saito.py   Corrected penalized Saito functional (Bombieri-Weyl norms, canonical
+                     logarithmic residual, multistart MM optimizer on sphere products)
+certificates.py      Exact symbolic Saito certificates over Q (the only accepted proof of freeness)
+tests/               Mathematical regression suite (incl. an independent exact reference
+                     implementation of the functional)
+benchmarks/          Validation study (lambda/beta sweeps, restart/iteration budgets, plots)
+experiments/         Extension-prefilter rerun + threshold refit; RL reward-arm comparison
 environment.py       Gym-like RL environment with pool and singularity-aware candidate modes
 model.py             Transformer Actor-Critic with cross-attention over candidate lines
 train.py             PPO training with adaptive triple curriculum and vectorized environments
@@ -100,7 +120,7 @@ pbs/                 HPC job scripts (step1_train, step2_explore, step3_verify, 
 
 ## The Loss Function
 
-The core challenge is that freeness is a discrete algebraic property: either the Saito determinant condition holds or it doesn't. The system converts this into a smooth, differentiable reward signal through a multi-level pipeline.
+The core challenge is that freeness is a discrete algebraic property: either the Saito determinant condition holds or it doesn't. The system converts this into a bounded, coordinate-normalized, upper-semicontinuous search signal through a multi-level pipeline. (The signal is *not* globally continuous, not smooth, and not a metric; its positive values are invariant under unitary/orthogonal coordinate changes only, and a numerical value is never a freeness certificate — see Level 2.)
 
 ### Level 1: Combinatorial Score
 
@@ -115,43 +135,77 @@ Returns a score in [-1, 1]:
 - Smooth interpolation toward -1.0 based on distance from a valid discriminant
 - Computed for every step, no linear algebra needed
 
-### Level 2: Smooth Saito Loss (the key innovation)
+### Level 2: Penalized Saito Loss (`penalized_saito.py`)
 
-For an arrangement with candidate exponents (d1, d2), this measures how far the arrangement is from satisfying Saito's criterion -- continuously, in coefficient space.
+> **Why the old "smooth Saito loss" was replaced.** The previous angular score
+> (ALS over SVD null-space bases) is **mathematically binary in exact
+> arithmetic**: for exact logarithmic derivations u, v of degrees d1 + d2 =
+> n - 1, every defining form alpha_i divides det M(theta_E, u, v), and the
+> degrees match deg Q, so the determinant is c·Q identically — with c = 0
+> unless the arrangement is free. The exact angular score is therefore 0
+> (free) or 1 (nonfree); the intermediate floating-point values it returned
+> measured SVD tolerances, conditioning, and rounding, not proximity to
+> freeness. It survives only as `saito.legacy_invalid_angular_score` for
+> regression comparisons and is never called in production.
 
-**Step 1 -- Derivation matrices.** For degree d, build the float64 matrix M_d encoding the divisibility constraints: for each line alpha_i and each parameterization degree (p, q = d - p), the matrix rows encode alpha_i | theta(alpha_i) evaluated on ker(alpha_i). This produces M_d1 of shape (n * (d1+1), 3 * C(d1+2,2)) and similarly M_d2.
+For any degree pair (d1, d2) with d1 + d2 = n - 1 (candidate-exponent
+arithmetic is a cheap pre-filter but does **not** gate the definition), the
+corrected loss works over the **full** coefficient spaces E_d = (S_d)^3 with
+Bombieri–Weyl (BW) Hermitian norms, all lines normalized to ||alpha|| = 1:
 
-**Step 2 -- Null space extraction.** Compute full orthonormal null space bases V2, V3 via SVD of M_d1, M_d2. These null spaces can be high-dimensional (50+ for large n), capturing all derivations that satisfy the divisibility constraints. Any theta2 = V2 @ alpha2, theta3 = V3 @ alpha3 (for parameter vectors alpha2, alpha3) is a valid logarithmic derivation of degree d1, d2 respectively.
+**Canonical logarithmic residual.** `L_{A,d}` maps u = (f, g, h) in E_d to the
+stack over lines of `(I - Pi_{alpha,d}) theta(alpha)`, where `Pi_{alpha,d}` is
+the BW-orthogonal projector onto alpha·S_{d-1}, scaled by 1/sqrt(n). Exactly
+`ker L_{A,d} = D(A)_d`, and **no SVD basis or rank tolerance enters the
+definition** (the projector has the closed form: restrict theta(alpha) to the
+line in an orthonormal parameterization and weight the binary-form
+coefficients by 1/sqrt(binom(d, p))).
 
-**Step 3 -- Bilinear determinant tensor.** Precompute a tensor T of shape (N_out, k2, k3) where N_out = C(n+2, 2) is the number of degree-n monomials, and k2, k3 are the null space dimensions. The tensor encodes:
+**Penalized objective.** With q = Q/||Q|| and unit u, v:
 
 ```
-det(theta_E, theta2, theta3) = T[alpha2, alpha3]
+R(u, v)     = ||L_{A,d1} u||^2 + ||L_{A,d2} v||^2          (tangency residual)
+Gamma(u, v) = |<B(u,v), q>|^2 / ( ||B(u,v)||^2 + lambda * R(u,v)^beta )
+loss        = 1 - sup Gamma     over the product of unit spheres
 ```
 
-expanding the 3x3 determinant via cofactor expansion along the Euler row:
+where B(u, v) = det M(theta_E, u, v), lambda > 0, 0 < beta < 1 (production
+default beta = 0.75, lambda = 1; both configurable; beta = 0.5 is supported
+but nonsmooth at R = 0 and is optimized by the MM/IRLS scheme, never by
+plain gradient ascent; beta = 1 is never used as the reported loss). The
+default optimization is over REAL coefficient vectors — complex is available
+and labeled (`optimization_field` in the diagnostics); for real arrangements
+S_complex <= S_real with the same zero locus. Properties (all tested in
+`tests/test_penalized_saito.py` and `tests/test_audit_penalized.py`):
 
-```
-det = x*(g2*h3 - g3*h2) - y*(f2*h3 - f3*h2) + z*(f2*g3 - f3*g2)
-```
+- loss ∈ [0, 1]; **0 exactly when A is free with exponents (1, d1, d2)**;
+  nonfree arrangements land strictly inside (0, 1);
+- upper semicontinuous in the arrangement (no constant-rank stratification
+  needed — the sup runs over fixed compact spheres);
+- nondecreasing in lambda on nonfree arrangements, -> 1 as lambda -> inf;
+  free arrangements stay at 0 for every lambda;
+- the zero set is projectively invariant; positive values are invariant under
+  unitary/orthogonal coordinate changes only;
+- an exponent-independent envelope `min over (d1, d2)` is available
+  (`penalized_saito_loss_all_pairs`), including d1 = 0 for pencils.
 
-where theta2 = (f2, g2, h2), theta3 = (f3, g3, h3). Each cross-term is a bilinear product of degree-d1 and degree-d2 polynomials (yielding degree n-1), then multiplied by x, y, or z to reach degree n. The multiplication uses precomputed sparse tables mapping monomial pairs to output indices.
+**Optimizer.** Multistart MM ascent on the product of spheres: the concave
+tangent of R^beta turns each half-step into an exact generalized-Rayleigh
+solve (u* = D^{-1} B_v^H q), monotone by construction and safeguarded by a
+backtracking line search. Initialization: leading singular vectors of the
+q-contracted bilinear map, near-kernel pairs (a heuristic that makes the free
+optimum easy to find — it affects only how tight the bound is, never the
+value being approximated), Sobol/random sphere points, and optional warm
+starts. Because the problem is nonconvex, the computed value `1 - Gamma_hat`
+is an **upper bound** on the ideal loss: a search signal, **never a freeness
+or nonfreeness certificate**. Exact certification is always symbolic
+(Level 3 / `certificates.py`).
 
-**Step 4 -- Alternating Least Squares (ALS).** Minimize:
-
-```
-L = ||T[alpha2, alpha3] - c * Q||^2 / ||Q||^2
-```
-
-where Q is the defining polynomial (product of all linear forms). Since T is bilinear in alpha2, alpha3, fixing one and solving for the other (plus scalar c) reduces to a linear least squares problem solvable by SVD of an augmented system [A | -q]. The algorithm alternates:
-
-1. Fix alpha3, solve for alpha2 via SVD of the augmented matrix
-2. Fix alpha2, solve for alpha3 via SVD of the augmented matrix
-3. Evaluate loss = 1 - cos^2(angle between T[alpha2, alpha3] and Q)
-
-This runs for 10 iterations with 3 random restarts. The loss is exactly 0 if and only if the arrangement is free. For non-free arrangements, it smoothly measures the angular distance between the best achievable determinant and the target polynomial Q.
-
-**Performance:** ~0.2ms (n=6), ~1.4ms (n=15), ~2.5ms (n=20).
+**Performance** (Apple M-class laptop core, `search` profile = 8 restarts x
+80 MM sweeps): ~15 ms (n = 6) to ~170 ms (n = 12–13) per evaluation; the
+`rl` profile used inside the reward is ~3x cheaper, plus caching by canonical
+line subset. Timings for the retired ALS score are not comparable — it was
+optimizing over a different (incorrectly restricted) domain.
 
 ### Level 3: Exact Saito Check
 
@@ -176,7 +230,7 @@ The reward returned to the RL agent at each step is:
 
 ```
 R = w_comb   * combinatorial_score(A)         # 0.3 -- b2 yields integer exponents?
-  + w_alg    * algebraic_score(A)              # 0.5 -- smooth Saito proximity
+  + w_alg    * algebraic_score(A)              # 0.5 -- penalized Saito score (1 - loss)
   + w_mult   * multiplicity_penalty(A)         # 2.0 -- penalize near-pencil
   + w_interest * interestingness_score(A)      # 1.0 -- rich singularity structure
   + w_feasibility * has_candidate_exponents    # 0.5 -- on a viable path
@@ -281,7 +335,9 @@ python main.py train \
 | `--n-envs` | 1 | Parallel environments (set to number of CPU cores) |
 | `--coord-range` | 3 | Integer coordinate range for candidate lines |
 | `--singularity-aware` | off | Dynamic candidate generation from intersection structure |
-| `--skip-exact-above` | 12 | Use smooth loss instead of exact sympy for n > this |
+| `--skip-exact-above` | 12 | Use the penalized loss instead of exact sympy for n > this |
+| `--reward-mode` | penalized | Reward arm: `penalized`, `potential`, `combinatorial`, `terminal`, `random`, or `legacy` (invalid; regression only) |
+| `--seed` | 0 | Random seed (torch/numpy/python + environment) |
 | `--total-steps` | 500000 | Total environment steps |
 | `--n-steps` | 2048 | Steps per PPO rollout |
 | `--batch-size` | 128 | Minibatch size for PPO updates |
@@ -307,7 +363,7 @@ python main.py explore --n 20 --model model_n20.pt --episodes 5000 --target-expo
 
 ### Post-hoc Exact Verification
 
-For n > 12, training uses the smooth loss proxy. Verify candidates exactly with sympy:
+For n > 12, training uses the penalized loss as a proxy (never as a certificate). Verify candidates exactly with sympy:
 
 ```bash
 python main.py verify-found --n 15 --model model_n20.pt --episodes 5000 --singularity-aware
@@ -317,11 +373,11 @@ python main.py verify-found --n 15 --model model_n20.pt --episodes 5000 --singul
 
 An 81-hour HPC training run with 16 parallel environments (5M PPO steps, full curriculum n=6..20, all default reward shaping) found **9,869 free arrangements at n ∈ {6, ..., 13} but ZERO at n ≥ 14**. Subsequent exploration runs (60 jobs × 5,000 episodes targeting specific (d1, d2) for n=14..20) also found nothing. Three independent root causes converge at the n=13→14 cliff:
 
-1. **Reward signal collapses for n > 12.** With `--skip-exact-above 12`, the strong `+10` exact-free terminal bonus is replaced by a graded bonus only when `algebraic_score > 0.95`. The smooth Saito loss is empirically chaotic with the default 3 ALS restarts: nearby arrangements get loss values that jump between 0 and 1 due to ALS local minima and hard SVD null-space dimension thresholds. Effectively the agent gets random reward for n>12 attempts.
+1. **Reward signal collapses for n > 12.** With `--skip-exact-above 12`, the strong `+10` exact-free terminal bonus is replaced by a graded bonus only when `algebraic_score > 0.95`. The historical run used the old ALS angular score, which was chaotic here by construction: in exact arithmetic that score is binary (0 free / 1 nonfree), so the intermediate float values it produced were artifacts of ALS local minima and hard SVD null-space dimension thresholds — effectively random reward for n > 12 attempts. The corrected penalized loss removes the null-space thresholds (it is upper semicontinuous with genuinely graded values; see the degeneration study in `results_penalized_saito/`), but the n ≥ 14 RL claims below predate it and would need retraining to re-establish.
 
 2. **Search space is too large for discrete RL.** For n=20 with ~200 candidates per step, the trajectory space is ≈ 200²⁰. Free arrangements form a measure-zero manifold inside this space; without a strong reward gradient, PPO is reduced to random search.
 
-3. **`smooth_saito_loss` is the wrong tool for the last mile.** It's a *signal*, not an *optimizer*. The discrete RL agent picks lines from a finite pool, but free arrangements live in a continuous parameter space — even when the agent is structurally close, every available candidate line is wrong by a small amount and there is no continuous knob to turn.
+3. **A scalar loss is the wrong tool for the last mile.** The penalized loss is a *signal*, not an *optimizer*. The discrete RL agent picks lines from a finite pool, but free arrangements live in a continuous parameter space — even when the agent is structurally close, every available candidate line is wrong by a small amount and there is no continuous knob to turn.
 
 The fix is to abandon "build from scratch with RL" for n ≥ 14 and instead use the next two strategies.
 
@@ -329,7 +385,7 @@ The fix is to abandon "build from scratch with RL" for n ≥ 14 and instead use 
 
 Take a known free arrangement, enumerate candidate lines that could extend it, pre-filter cheaply, and exact-verify the survivors. Adding **one good line** to a known free arrangement is exponentially easier than discovering a free arrangement of n+1 lines from scratch — and discoveries cascade: today's n=13 result becomes tomorrow's n=14 seed.
 
-The `extend` command implements this: it takes a seed arrangement at n_from, enumerates candidate lines from three sources (lines through pairs of existing intersection points, the small-integer pool, and optionally rational lines through multiple points), pre-filters via `smooth_saito_loss`, and exact-verifies the survivors with sympy. **Empirical result**: starting from existing n=12 seeds (105 arrangements), a local cascade in under 24 hours produced 1,602 free arrangements at n=13..18 and 1,774 more at n=19, covering ground that the 81-hour RL training never reached.
+The `extend` command implements this: it takes a seed arrangement at n_from, enumerates candidate lines from three sources (lines through pairs of existing intersection points, the small-integer pool, and optionally rational lines through multiple points), pre-filters via the penalized Saito loss (`saito_loss`), and exact-verifies the survivors with sympy. Every reported free arrangement carries an exact symbolic certificate — the numerical filter only decides which candidates get the exact check. **Historical empirical result (obtained with the old angular pre-filter at 0.05; see `results_penalized_saito/` for the rerun with the corrected loss and a refit threshold)**: starting from existing n=12 seeds (105 arrangements), a local cascade in under 24 hours produced 1,602 free arrangements at n=13..18 and 1,774 more at n=19, covering ground that the 81-hour RL training never reached. The freeness of those arrangements is established by their exact certificates and is unaffected by the filter change.
 
 ```bash
 # Extend known n=12 arrangements to find n=13 free arrangements
@@ -348,8 +404,8 @@ done
 | `--output` | same as seeds | Where to save new discoveries |
 | `--coord-range` | 5 | Integer pool range for new candidate lines |
 | `--max-denominator` | 1 | If >1, also generate rational lines through existing multiple points |
-| `--loss-threshold` | 0.05 | Pre-filter: skip exact check if smooth loss above this |
-| `--n-restarts` | 10 | ALS restarts in the smooth loss pre-filter |
+| `--loss-threshold` | 0.05 | Pre-filter: skip exact check if the penalized loss is above this (threshold refit on a validation benchmark; see `results_penalized_saito/`) |
+| `--n-restarts` | 10 | Optimizer restarts in the penalized-loss pre-filter |
 | `--max-seeds` | None | Limit seeds (for testing) |
 | `--target-exponents` | None | Filter seeds by their exponents |
 | `--target-new-exponents` | None | Target a specific (d1, d2) for the n+1 result. Uses Δb2 pre-filter. |
@@ -497,6 +553,13 @@ tail -f logs/extend_n*.log          # monitor unfiltered cascade
 
 
 ## Citation
+
+> Note: the arXiv preprint below describes the retired *angular* functional,
+> which is binary in exact arithmetic (see the migration note at the top).
+> The manuscript is being revised around the penalized residual-based loss
+> implemented in `penalized_saito.py`; a claims audit is in
+> `results_penalized_saito/`.
+
 ```
 @misc{silva2026semicontinuousrelaxationsaitoscriterion,
       title={A semicontinuous relaxation of Saito's criterion and freeness as angular minimization}, 

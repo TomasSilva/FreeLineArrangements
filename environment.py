@@ -138,7 +138,8 @@ def _score_line_against_structure(line, arr):
 SCALAR_DIM = 17   # 14 base + 3 exponent-targeting features
 
 def extract_scalars(arr: LineArrangement, target_n: int,
-                    target_exponents=None) -> np.ndarray:
+                    target_exponents=None, score_mode: str = 'penalized'
+                    ) -> np.ndarray:
     """
     Build scalar feature vector for the policy network.
 
@@ -226,7 +227,13 @@ def extract_scalars(arr: LineArrangement, target_n: int,
         m4p / max(1, n),
         float(arr.is_pencil()),
         combinatorial_score(arr),
-        algebraic_score(arr, target_exponents=target_exponents) if n >= 3 else 0.0,
+        # feature [8]: algebraic score under the active reward mode.
+        # 'penalized' (default) = corrected penalized-loss score;
+        # 'legacy' = explicitly-invalid old angular score (regression arm);
+        # anything else = 0.0 so score-free arms leak no loss signal via obs.
+        (algebraic_score(arr, target_exponents=target_exponents,
+                         use_legacy=(score_mode == 'legacy'))
+         if n >= 3 and score_mode in ('penalized', 'legacy') else 0.0),
         max_mult / max(1, target_n),
         n_pts / max(1, n * (n - 1) / 2),
         # singularity-aware
@@ -276,7 +283,25 @@ class FreeArrangementEnv:
         w_interest: float = 1.0,
         skip_exact_above: int = 12,
         seed: int = 0,
+        reward_mode: str = 'penalized',
+        gamma_shaping: float = 0.99,
     ):
+        # reward_mode arms (for controlled comparisons, see §8 of the
+        # penalized-loss migration report):
+        #   'penalized'     composite reward with the corrected loss (default)
+        #   'potential'     potential-based shaping gamma*Phi' - Phi with
+        #                   Phi = Gamma_hat, plus exact terminal bonus
+        #   'combinatorial' composite with w_alg = 0 (no algebraic signal)
+        #   'terminal'      binary exact-freeness bonus at terminal only
+        #   'random'        zero reward (unguided search baseline)
+        #   'legacy'        composite with legacy_invalid_angular_score
+        #                   (explicitly invalid regression baseline)
+        if reward_mode not in ('penalized', 'potential', 'combinatorial',
+                               'terminal', 'random', 'legacy'):
+            raise ValueError(f"unknown reward_mode {reward_mode!r}")
+        self.reward_mode = reward_mode
+        self.gamma_shaping = gamma_shaping
+        self._phi_prev = 0.0
         self.target_n = target_n
         self.max_n = max_n if max_n is not None else target_n
         self.max_candidates = max_candidates
@@ -318,6 +343,7 @@ class FreeArrangementEnv:
         self.step_count = 0
         self.done = False
         self.episode_reward = 0.0
+        self._phi_prev = 0.0
 
         # Current dynamic candidates (regenerated each step in sing-aware mode)
         self.current_candidates = []
@@ -431,8 +457,15 @@ class FreeArrangementEnv:
         for i, line in enumerate(self.arr.lines):
             sel[i] = line.to_float()
 
+        if self.reward_mode in ('penalized', 'potential'):
+            score_mode = 'penalized'
+        elif self.reward_mode == 'legacy':
+            score_mode = 'legacy'
+        else:
+            score_mode = 'none'   # blind the score-free arms
         scalars = extract_scalars(self.arr, self.target_n,
-                                  target_exponents=self.target_exponents)
+                                  target_exponents=self.target_exponents,
+                                  score_mode=score_mode)
 
         return {
             'selected_coords': sel,
@@ -444,6 +477,79 @@ class FreeArrangementEnv:
 
     def action_mask(self):
         return self.current_mask.copy()
+
+    # ── Reward modes ──────────────────────────────────────────────────────────
+
+    def _exact_free_terminal(self):
+        """Exact symbolic terminal check (gated by skip_exact_above)."""
+        if self.arr.candidate_exponents() is None:
+            return False
+        if len(self.arr) > self.skip_exact_above:
+            return False
+        is_free, _ = self.arr.is_free()
+        return bool(is_free)
+
+    def _potential(self):
+        """Phi(A) = Gamma_hat(A) for potential-based shaping.
+
+        When the episode has target exponents and the arrangement is at full
+        size (d1 + d2 = n - 1), score against that pair — the loss is defined
+        there regardless of candidate-exponent arithmetic.  During growth (or
+        without a target), fall back to the arrangement's own candidate
+        exponents when they exist, else 0.  Any state potential yields
+        policy-invariant shaping; this choice keeps the hot path cheap.
+        """
+        from saito import saito_loss
+        arr = self.arr
+        n = len(arr)
+        if n < 3:
+            return 0.0
+        te = self.target_exponents
+        if te is not None and te[0] + te[1] == n - 1:
+            return 1.0 - saito_loss(arr, target_exponents=tuple(te),
+                                    profile='rl', cached=True)
+        if arr.candidate_exponents() is None:
+            return 0.0
+        return 1.0 - saito_loss(arr, profile='rl', cached=True)
+
+    def _compute_reward(self, prev_arr, is_pencil, is_terminal):
+        mode = self.reward_mode
+        if mode == 'random':
+            return 0.0
+        if mode == 'terminal':
+            if is_terminal and not is_pencil and self._exact_free_terminal():
+                return self.w_free
+            return 0.0
+        if mode == 'potential':
+            if is_pencil:
+                self._phi_prev = 0.0
+                return -self.w_pencil
+            phi_new = self._potential()
+            reward = self.gamma_shaping * phi_new - self._phi_prev
+            self._phi_prev = phi_new
+            if is_terminal and self._exact_free_terminal():
+                reward += self.w_free
+            return reward
+        # composite modes: 'penalized' (default), 'combinatorial', 'legacy'
+        return saito_reward(
+            self.arr,
+            target_n=self.target_n,
+            prev_arr=prev_arr,
+            w_comb=self.w_comb,
+            w_alg=0.0 if mode == 'combinatorial' else self.w_alg,
+            w_pencil=self.w_pencil,
+            w_free=self.w_free,
+            w_mult=self.w_mult,
+            w_interest=self.w_interest,
+            terminal_only_free_bonus=True,
+            skip_exact_above=self.skip_exact_above,
+            target_exponents=self.target_exponents,
+            use_legacy=(mode == 'legacy'),
+            # score-free arm: the exact terminal bonus stays, but the
+            # algebraic-score-based partial bonus for n > skip_exact_above
+            # must not leak loss signal into this arm
+            terminal_alg_bonus=(mode != 'combinatorial'),
+        )
 
     # ── Step ──────────────────────────────────────────────────────────────────
 
@@ -474,20 +580,7 @@ class FreeArrangementEnv:
         is_terminal = (self.step_count == self.target_n)
         self.done = is_terminal or is_pencil
 
-        reward = saito_reward(
-            self.arr,
-            target_n=self.target_n,
-            prev_arr=prev_arr,
-            w_comb=self.w_comb,
-            w_alg=self.w_alg,
-            w_pencil=self.w_pencil,
-            w_free=self.w_free,
-            w_mult=self.w_mult,
-            w_interest=self.w_interest,
-            terminal_only_free_bonus=True,
-            skip_exact_above=self.skip_exact_above,
-            target_exponents=self.target_exponents,
-        )
+        reward = self._compute_reward(prev_arr, is_pencil, is_terminal)
 
         info = {
             'n': len(self.arr),

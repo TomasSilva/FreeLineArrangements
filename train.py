@@ -633,6 +633,12 @@ def ppo_update_flat(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(args):
+    seed = getattr(args, 'seed', 0)
+    torch.manual_seed(seed)
+    np.random.seed(seed % (2 ** 32))
+    import random as _random
+    _random.seed(seed)
+
     n_min = getattr(args, 'n_min', args.n)
     n_max = getattr(args, 'n_max', args.n)
     n_envs = getattr(args, 'n_envs', 1)
@@ -660,6 +666,11 @@ def train(args):
         w_mult=args.w_mult,
         w_interest=getattr(args, 'w_interest', 1.0),
         skip_exact_above=getattr(args, 'skip_exact_above', 12),
+        reward_mode=getattr(args, 'reward_mode', 'penalized'),
+        gamma_shaping=args.gamma,   # potential-based shaping must use the
+                                    # same discount as GAE to stay
+                                    # policy-invariant
+        seed=seed,
     )
 
     use_vec = n_envs > 1
@@ -669,7 +680,8 @@ def train(args):
     if use_vec:
         print(f"Building {n_envs} parallel environments: n_min={n_min}, n_max={n_max}, "
               f"coord_range={args.coord_range}, singularity_aware={singularity_aware}")
-        env_kwargs_list = [{**env_kwargs, 'seed': 42 + i} for i in range(n_envs)]
+        env_kwargs_list = [{**env_kwargs, 'seed': seed * 1000 + 42 + i}
+                           for i in range(n_envs)]
         vec_env = SubprocVecEnv(env_kwargs_list)
         print(f"Vectorized: {n_envs} workers, steps_per_update={args.n_steps * n_envs}")
     else:
@@ -882,6 +894,15 @@ def get_parser():
                    help="Initial steps drawn from static pool (singularity-aware mode)")
     p.add_argument("--pool-sample-frac", type=float, default=0.3,
                    help="Fraction of candidates from static pool (singularity-aware mode)")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Random seed (torch/numpy/python + env)")
+    p.add_argument("--reward-mode", type=str, default="penalized",
+                   choices=["penalized", "potential", "combinatorial",
+                            "terminal", "random", "legacy"],
+                   help="Reward arm: corrected penalized loss (default), "
+                        "potential-based shaping, combinatorial-only, binary "
+                        "terminal, zero reward, or the explicitly-invalid "
+                        "legacy angular score (regression baseline only)")
     p.add_argument("--skip-exact-above", type=int, default=12,
                    help="Skip exact Saito check during training for n > this value")
     p.add_argument("--log-every", type=int, default=5)
