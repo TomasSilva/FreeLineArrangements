@@ -62,13 +62,24 @@ __all__ = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 _LINE_RE = re.compile(r'([+-]?[\d/]*)x([+-][\d/]*)y([+-][\d/]*)z')
+# Field-extension grammar: a coefficient is either the legacy rational token
+# or a bracketed quadratic token '[a+bs]' with s = sqrt(d) (record-level
+# field tag required; see quadfield.parse_quad_token).
+_TOKEN = r'(?:\[[^\]]+\]|[\d/]*)'
+_LINE_RE_K = re.compile(rf'([+-]?{_TOKEN})x([+-]{_TOKEN})y([+-]{_TOKEN})z')
 
 
-def parse_line_str(s):
-    """Parse '(ax+by+cz=0)' (discoveries.json format) into a ProjectiveLine."""
+def parse_line_str(s, field=None):
+    """Parse '(ax+by+cz=0)' (discoveries.json format) into a ProjectiveLine.
+
+    `field` (a quadfield.QuadraticField or discriminant int) is required
+    when the string contains quadratic bracket tokens '[a+bs]'; rational
+    strings parse exactly as before.
+    """
     s = (s.strip().strip('(').rstrip(')').replace('=0', '')
           .replace(' ', '').replace('+-', '-'))
-    m = _LINE_RE.match(s)
+    has_bracket = '[' in s
+    m = (_LINE_RE_K if has_bracket else _LINE_RE).match(s)
     if not m:
         raise ValueError(f"Cannot parse line: {s}")
 
@@ -78,16 +89,28 @@ def parse_line_str(s):
             return 1
         if c == '-':
             return -1
+        if c.startswith('[') or c.startswith('-['):
+            from quadfield import parse_quad_token
+            neg = c.startswith('-')
+            elem = parse_quad_token(c.lstrip('-')[1:-1], field)
+            return -elem if neg else elem
         return Fraction(c)
 
-    return ProjectiveLine(Rational(to_rat(m.group(1))),
-                          Rational(to_rat(m.group(2))),
-                          Rational(to_rat(m.group(3))))
+    return ProjectiveLine(to_rat(m.group(1)), to_rat(m.group(2)),
+                          to_rat(m.group(3)))
+
+
+def field_from_record(rec):
+    """quadfield.QuadraticField declared by a record, or None for QQ."""
+    from quadfield import QuadraticField
+    return QuadraticField.from_json(rec.get("coefficient_field"))
 
 
 def arrangement_from_record(rec):
     """Build a LineArrangement from a discoveries-JSON record."""
-    return LineArrangement([parse_line_str(s) for s in rec["lines"]])
+    field = field_from_record(rec)
+    return LineArrangement([parse_line_str(s, field=field)
+                            for s in rec["lines"]])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,8 +164,14 @@ def lattices_isomorphic(a: LineArrangement, b: LineArrangement) -> bool:
 
 def is_essential(arr: LineArrangement) -> bool:
     """Rank-3 normal matrix (the cone is essential in C^3)."""
+    if len(arr) < 3:
+        return False
+    K = arr.coefficient_field()
+    if K is not None:
+        from quadfield import k_rank
+        return k_rank([list(l.coords) for l in arr.lines], K) == 3
     m = np.array([l.to_float() for l in arr.lines])
-    return len(arr) >= 3 and np.linalg.matrix_rank(m) == 3
+    return np.linalg.matrix_rank(m) == 3
 
 
 def is_near_pencil(arr: LineArrangement) -> bool:
@@ -198,12 +227,26 @@ def check_supersolvable_consistency(arr: LineArrangement, exponents) -> bool:
 
 def coordinate_height(arr: LineArrangement) -> int:
     """Max |numerator|/|denominator| over all line coordinates (elite
-    tie-breaker: low-height representatives certify faster)."""
+    tie-breaker: low-height representatives certify faster).
+
+    QQ lines: exactly the historical computation (max |p|, |q| per
+    coordinate).  Quadratic-field lines a + b*sqrt(d): naive height in the
+    basis {1, sqrt(d)} over the (a, b) pairs (`naive_height_basis_1_sqrtd`;
+    for d = 5, -3 this is within 2x of the true O_K height — a
+    reporting/tie-break stat, not a mathematical claim).
+    """
+    from quadfield import split_parts
     h = 1
     for line in arr.lines:
-        for c in line.coords:
-            r = Rational(c)
-            h = max(h, abs(int(r.p)), abs(int(r.q)))
+        if getattr(line, "field", None) is None:
+            for c in line.coords:
+                r = Rational(c)
+                h = max(h, abs(int(r.p)), abs(int(r.q)))
+        else:
+            for c in line.coords:
+                for r in split_parts(c):
+                    r = Rational(r)
+                    h = max(h, abs(int(r.p)), abs(int(r.q)))
     return int(h)
 
 

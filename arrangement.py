@@ -11,19 +11,34 @@ from sympy import Rational, Matrix, symbols, binomial
 from itertools import combinations
 from collections import defaultdict
 
+from quadfield import QuadElem, scalar_field
+
 
 x, y, z = symbols('x y z')
+
+
+def _coerce_coord(v):
+    """Rational for rational inputs (unchanged QQ path); QuadElem passes."""
+    if isinstance(v, QuadElem):
+        return v
+    return Rational(v)
 
 
 # ─── Projective line ──────────────────────────────────────────────────────────
 
 class ProjectiveLine:
-    """Line ax+by+cz=0 in CP^2, represented by projective point [a:b:c]."""
+    """Line ax+by+cz=0 in CP^2, represented by projective point [a:b:c].
+
+    Coordinates are sympy Rationals (field QQ) or quadfield.QuadElem
+    elements of one quadratic field Q(sqrt(d)); `self.field` is that
+    QuadraticField, or None for QQ.
+    """
 
     def __init__(self, a, b, c):
-        coords = (Rational(a), Rational(b), Rational(c))
+        coords = (_coerce_coord(a), _coerce_coord(b), _coerce_coord(c))
         assert not all(c == 0 for c in coords), "Zero line"
         self.coords = self._canonical(coords)
+        self.field = scalar_field(self.coords)
 
     @staticmethod
     def _canonical(coords):
@@ -59,8 +74,21 @@ class ProjectiveLine:
     def to_float(self):
         return np.array([float(v) for v in self.coords])
 
+    def embed(self):
+        """Numeric coordinates under the field's principal embedding.
+
+        float64 for QQ / real quadratic fields, complex128 for complex ones.
+        """
+        if self.field is not None and not self.field.is_real:
+            return np.array([complex(v) for v in self.coords],
+                            dtype=np.complex128)
+        return np.array([float(v) for v in self.coords])
+
     def linear_form(self):
         a, b, c = self.coords
+        if self.field is not None:
+            a, b, c = (v.to_sympy() if isinstance(v, QuadElem) else v
+                       for v in (a, b, c))
         return a * x + b * y + c * z
 
     @classmethod
@@ -113,6 +141,22 @@ class LineArrangement:
 
     def __len__(self):
         return len(self.lines)
+
+    def coefficient_field(self):
+        """QuadraticField shared by the lines, or None for QQ.
+
+        Derived from the coordinates (never stored on the arrangement), so
+        it cannot desynchronize under add/remove.  Mixing fields raises.
+        """
+        field = None
+        for line in self.lines:
+            f = getattr(line, "field", None)
+            if f is not None:
+                if field is None:
+                    field = f
+                elif field.d != f.d:
+                    raise ValueError("mixed quadratic fields in arrangement")
+        return field
 
     # ── Intersection structure ────────────────────────────────────────────────
 
@@ -220,8 +264,8 @@ class LineArrangement:
 
     @staticmethod
     def _ker_basis(a, b, c):
-        """Two rational basis vectors for ker([a,b,c])."""
-        a, b, c = Rational(a), Rational(b), Rational(c)
+        """Two K-rational basis vectors for ker([a,b,c])."""
+        a, b, c = _coerce_coord(a), _coerce_coord(b), _coerce_coord(c)
         if a != 0:
             u = [-b, a, Rational(0)]
             v = [-c, Rational(0), a]
@@ -250,11 +294,12 @@ class LineArrangement:
                         res += c
         return res
 
-    def derivation_matrix(self, d):
-        """
-        Build matrix M (over Q) such that ker(M) = D(A)_d.
-        Variables: [f_coeffs | g_coeffs | h_coeffs], each of length C(d+2,2).
-        For each line alpha_i, condition alpha_i | (a_i*f + b_i*g + c_i*h).
+    def _derivation_rows(self, d):
+        """Rows of the derivation-condition matrix (entries in K).
+
+        Same construction as `derivation_matrix`, but returned as plain
+        Python lists so quadratic-field entries (QuadElem) survive; the QQ
+        path wraps them in a sympy Matrix exactly as before.
         """
         monoms = self._monoms(d)
         N = len(monoms)
@@ -270,10 +315,26 @@ class LineArrangement:
                     row[N + idx]   += b * coeff
                     row[2*N + idx] += c * coeff
                 rows.append(row)
-        return Matrix(rows)
+        return rows
+
+    def derivation_matrix(self, d):
+        """
+        Build matrix M (over Q) such that ker(M) = D(A)_d.
+        Variables: [f_coeffs | g_coeffs | h_coeffs], each of length C(d+2,2).
+        For each line alpha_i, condition alpha_i | (a_i*f + b_i*g + c_i*h).
+
+        QQ only — quadratic-field arrangements use `_derivation_rows` with
+        `quadfield.k_rank`/`k_nullspace` (Weil restriction) instead.
+        """
+        return Matrix(self._derivation_rows(d))
 
     def derivation_space_dim(self, d):
-        """Dimension of D(A)_d."""
+        """Dimension over K of D(A)_d."""
+        K = self.coefficient_field()
+        if K is not None:
+            from quadfield import k_rank
+            rows = self._derivation_rows(d)
+            return 3 * len(self._monoms(d)) - k_rank(rows, K)
         M = self.derivation_matrix(d)
         # rank + nullity = 3 * C(d+2, 2)
         return 3 * len(self._monoms(d)) - M.rank()
@@ -293,8 +354,13 @@ class LineArrangement:
 
         # For free arrangement: D(A)_d1 has dimension C(d1+1,2)+1 (if d1<=d2)
         # We check by finding the null space of the derivation matrix
-        M_d1 = self.derivation_matrix(d1)
-        null_d1 = M_d1.nullspace()
+        K = self.coefficient_field()
+        if K is not None:
+            from quadfield import k_nullspace
+            null_d1 = k_nullspace(self._derivation_rows(d1), K)
+        else:
+            M_d1 = self.derivation_matrix(d1)
+            null_d1 = M_d1.nullspace()
 
         if not null_d1:
             return False, None
@@ -302,6 +368,11 @@ class LineArrangement:
         # Similarly for d2
         if d1 == d2:
             null_d2 = null_d1
+        elif K is not None:
+            from quadfield import k_nullspace
+            null_d2 = k_nullspace(self._derivation_rows(d2), K)
+            if not null_d2:
+                return False, None
         else:
             M_d2 = self.derivation_matrix(d2)
             null_d2 = M_d2.nullspace()
