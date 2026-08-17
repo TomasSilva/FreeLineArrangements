@@ -236,11 +236,24 @@ class ChainEvaluator:
         self.warm = None          # (u, v) from the last refined evaluation
         self.n_screen = 0
         self.n_refine = 0
+        self.n_numerical_errors = 0
 
     def screen_loss(self, arr) -> float:
+        """Raw penalized loss (rl profile, cached).  Raises
+        GammaNumericalError on evaluation failure — engines catch it per
+        proposal, skip the move, and count the event; a failure is never a
+        loss value."""
         self.n_screen += 1
         return cached_penalized_loss(arr, d1=self.d1, d2=self.d2,
                                      profile='rl', seed=self.seed)
+
+    def screen_loss_or_none(self, arr):
+        from penalized_saito import GammaNumericalError
+        try:
+            return self.screen_loss(arr)
+        except GammaNumericalError:
+            self.n_numerical_errors += 1
+            return None
 
     def refined_loss(self, arr) -> float:
         """Search-profile evaluation with warm start; updates the warm pair."""
@@ -259,8 +272,19 @@ class ChainEvaluator:
         b2_gap = abs(arr.b2() - self.b2_star) / max(1, self.b2_star)
         return loss + self.w_b2 * b2_gap
 
+    def energy_components(self, arr, loss) -> dict:
+        """Separately logged energy components (audit requirement): the
+        RAW Saito loss, the b2-shell penalty and weight, and the total.
+        Calibration NEVER appears here — engines rank by raw loss."""
+        b2_pen = abs(arr.b2() - self.b2_star) / max(1, self.b2_star)
+        return {"raw_saito_loss": float(loss),
+                "b2_shell_penalty": float(b2_pen),
+                "b2_shell_weight": float(self.w_b2),
+                "total_energy": float(loss + self.w_b2 * b2_pen)}
+
     def stats(self):
-        return {"screen_evals": self.n_screen, "refine_evals": self.n_refine}
+        return {"screen_evals": self.n_screen, "refine_evals": self.n_refine,
+                "numerical_errors": self.n_numerical_errors}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -307,8 +331,12 @@ def greedy_search(state, d1, d2, evaluator, rng, steps=200,
     """Greedy best-of-k swap descent.  Returns (best_arr, best_loss, log)."""
     pk = dict(proposal_kwargs or {})
     cur = state
-    cur_energy = evaluator.energy(cur)
-    best = (cur, evaluator.screen_loss(cur))
+    seed_loss = evaluator.screen_loss_or_none(cur)
+    if seed_loss is None:
+        raise RuntimeError("greedy_search: seed state failed numerical "
+                           "evaluation")
+    cur_energy = evaluator.energy(cur, seed_loss)
+    best = (cur, seed_loss)
     log = []
     tabu = {canonical_lineset_key(cur)}
     for step in range(steps):
@@ -318,8 +346,13 @@ def greedy_search(state, d1, d2, evaluator, rng, steps=200,
             break
         scored = []
         for (i, line, trial) in proposals:
-            loss = evaluator.screen_loss(trial)
+            loss = evaluator.screen_loss_or_none(trial)
+            if loss is None:
+                continue          # numerical failure: skip move, counted
             scored.append((evaluator.energy(trial, loss), loss, trial))
+        if not scored:
+            log.append({"step": step, "event": "all_proposals_failed"})
+            break
         scored.sort(key=lambda t: t[0])
         e_new, loss_new, arr_new = scored[0]
         if e_new >= cur_energy:
@@ -331,7 +364,8 @@ def greedy_search(state, d1, d2, evaluator, rng, steps=200,
         if loss_new < best[1]:
             best = (cur, loss_new)
         if on_candidate is not None and loss_new < LOSS_CANDIDATE_THRESHOLD:
-            on_candidate(_record(cur, d1, d2, loss_new, "greedy", step))
+            on_candidate(_record(cur, d1, d2, loss_new, "greedy", step,
+                                 extra=evaluator.energy_components(cur, loss_new)))
         if loss_new < loss_tol:
             break
     return best[0], best[1], log
@@ -342,18 +376,26 @@ def random_walk(state, d1, d2, evaluator, rng, steps=500,
     """Uniform random valid swaps (baseline)."""
     pk = dict(proposal_kwargs or {})
     cur = state
-    best = (cur, evaluator.screen_loss(cur))
+    seed_loss = evaluator.screen_loss_or_none(cur)
+    if seed_loss is None:
+        raise RuntimeError("random_walk: seed state failed numerical "
+                           "evaluation")
+    best = (cur, seed_loss)
     for step in range(steps):
         proposals = propose_swaps(cur, d1, d2, rng, n_remove=1,
                                   n_add_per_remove=1, **pk)
         if not proposals:
             continue
-        _, _, cur = proposals[0]
-        loss = evaluator.screen_loss(cur)
+        _, _, nxt = proposals[0]
+        loss = evaluator.screen_loss_or_none(nxt)
+        if loss is None:
+            continue              # numerical failure: skip, counted
+        cur = nxt
         if loss < best[1]:
             best = (cur, loss)
         if on_candidate is not None and loss < LOSS_CANDIDATE_THRESHOLD:
-            on_candidate(_record(cur, d1, d2, loss, "walk", step))
+            on_candidate(_record(cur, d1, d2, loss, "walk", step,
+                                 extra=evaluator.energy_components(cur, loss)))
     return best[0], best[1], []
 
 
@@ -422,7 +464,9 @@ def map_elites(seeds, d1, d2, evaluator, rng, generations=3000,
         return rec
 
     for s in seeds:
-        add_to_archive(s, evaluator.screen_loss(s))
+        sl = evaluator.screen_loss_or_none(s)
+        if sl is not None:
+            add_to_archive(s, sl)
 
     for gen in range(generations):
         # deterministic parent selection: uniform over cells, then over elites
@@ -447,10 +491,13 @@ def map_elites(seeds, d1, d2, evaluator, rng, generations=3000,
             child = props[0][2]
         if child is parent:
             continue
-        loss = evaluator.screen_loss(child)
+        loss = evaluator.screen_loss_or_none(child)
+        if loss is None:
+            continue              # numerical failure: never archived
         rec = add_to_archive(child, loss)
         if on_candidate is not None and loss < LOSS_CANDIDATE_THRESHOLD:
-            on_candidate(_record(child, d1, d2, loss, "map_elites", gen))
+            on_candidate(_record(child, d1, d2, loss, "map_elites", gen,
+                                 extra=evaluator.energy_components(child, loss)))
         if best[1] < loss_tol:
             break
         if on_snapshot is not None and (gen + 1) % snapshot_every == 0:
@@ -466,8 +513,12 @@ def simulated_annealing(state, d1, d2, evaluator, rng, steps=2000,
     line-sets, and reheats on stagnation.  Returns (best_arr, best_loss, log)."""
     pk = dict(proposal_kwargs or {})
     cur = state
-    cur_energy = evaluator.energy(cur)
-    best = (cur, evaluator.screen_loss(cur))
+    seed_loss = evaluator.screen_loss_or_none(cur)
+    if seed_loss is None:
+        raise RuntimeError("simulated_annealing: seed state failed "
+                           "numerical evaluation")
+    cur_energy = evaluator.energy(cur, seed_loss)
+    best = (cur, seed_loss)
     T = t0
     tabu = {canonical_lineset_key(cur)}
     since_improve = 0
@@ -480,7 +531,10 @@ def simulated_annealing(state, d1, d2, evaluator, rng, steps=2000,
             T = min(t0, T / cooling)
             continue
         i, line, trial = proposals[0]
-        loss = evaluator.screen_loss(trial)
+        loss = evaluator.screen_loss_or_none(trial)
+        if loss is None:
+            since_improve += 1    # numerical failure: skip move, counted
+            continue
         e_new = evaluator.energy(trial, loss)
         accept = e_new <= cur_energy or \
             rng.random() < exp(-(e_new - cur_energy) / max(T, 1e-12))
@@ -495,7 +549,8 @@ def simulated_annealing(state, d1, d2, evaluator, rng, steps=2000,
             else:
                 since_improve += 1
             if on_candidate is not None and loss < LOSS_CANDIDATE_THRESHOLD:
-                on_candidate(_record(cur, d1, d2, loss, "anneal", step))
+                on_candidate(_record(cur, d1, d2, loss, "anneal", step,
+                                     extra=evaluator.energy_components(cur, loss)))
             if loss < loss_tol:
                 break
         else:

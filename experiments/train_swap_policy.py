@@ -70,6 +70,18 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # resume guard: a run directory carries its calibration mode; a
+    # conflicting request FAILS instead of silently changing the reward
+    prev_manifest = os.path.join(args.out, "manifest.json")
+    if os.path.exists(prev_manifest):
+        with open(prev_manifest) as pf:
+            prev = json.load(pf)
+        if prev["args"].get("tau_mode", "none") != args.tau_mode:
+            raise SystemExit(
+                f"resume conflict: run dir has tau_mode="
+                f"{prev['args'].get('tau_mode')!r}, requested "
+                f"{args.tau_mode!r} — refusing to change the reward "
+                f"definition of an existing run")
     tau = None
     if args.tau_mode != "none":
         from calibration import compute_tau

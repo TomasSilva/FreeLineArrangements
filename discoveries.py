@@ -19,7 +19,13 @@ import time
 from datetime import datetime, timezone
 
 
-DEFAULT_PATH = "discoveries.json"
+# Production contract (2026-08 final audit): discoveries.json contains ONLY
+# exactly-verified promoted entries and is written ONLY by
+# promotion.promote().  All legacy logging paths (grow-RL train/explore/
+# extend CLIs) now stage into this separate file; promotion to the verified
+# store goes through the certificate-checked promoter.
+DEFAULT_PATH = "discoveries_staging.json"
+VERIFIED_STORE_PATH = "discoveries.json"   # write via promotion.promote only
 
 
 # ── Canonical key ─────────────────────────────────────────────────────────────

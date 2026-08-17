@@ -217,7 +217,8 @@ def canonical_lineset_key(arr: LineArrangement) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_CORPUS_PATHS = [
-    "discoveries.json", "cascade_v2.json", "coverage_test.json",
+    "discoveries.json", "legacy_candidates.json", "discoveries_staging.json",
+    "cascade_v2.json", "coverage_test.json",
     "discoveries_final.json", "cascade_discoveries.json",
     "HPC_partil_discoveries.json", "ddddiscoveries.json",
     "discoveries_agora.json", "new_discoveries.json", "old_discoveries.json",

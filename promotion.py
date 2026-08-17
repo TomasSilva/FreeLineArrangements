@@ -153,12 +153,155 @@ def _load_store(path):
 
 
 def _atomic_write(data, path):
+    """tmp write + fsync + os.replace + PARENT-DIRECTORY fsync (crash
+    durability of the rename itself)."""
     tmp = path + f".tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=1, default=str)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    try:
+        dfd = os.open(os.path.dirname(os.path.abspath(path)) or ".",
+                      os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def load_verified_discoveries(path, reverify=True):
+    """STRICT loader for the verified store: returns only entries with a
+    supported schema version, verification_status == 'verified_exact', a
+    certificate present, and (when reverify) verify_certificate passing.
+    Everything else is returned separately as rejects — never counted as a
+    discovery."""
+    data = _load_store(path)
+    ok, rejects = [], []
+    for r in data["arrangements"]:
+        if r.get("schema_version") != SCHEMA_VERSION:
+            rejects.append((r, "unsupported_schema"))
+            continue
+        if r.get("verification_status") != "verified_exact":
+            rejects.append((r, "not_verified_exact"))
+            continue
+        if "certificate" not in r:
+            rejects.append((r, "missing_certificate"))
+            continue
+        if reverify:
+            try:
+                if not verify_certificate(
+                        certificate_from_json(r["certificate"])):
+                    rejects.append((r, "failed_reverification"))
+                    continue
+            except Exception as ex:
+                rejects.append((r, f"certificate_error({ex})"))
+                continue
+        ok.append(r)
+    return ok, rejects
+
+
+def migrate_legacy_store(path, out_legacy=None, out_quarantine=None,
+                         dry_run=False):
+    """Recoverable migration enforcing the contract that discoveries.json
+    holds ONLY exactly-verified schema-2 entries.
+
+    1. checksum-addressed backup of the current file;
+    2. partition into verified schema-2 / legacy-unverified / malformed;
+    3. verified entries stay; legacy candidates move to legacy_candidates
+       .json (original data + provenance + original index + migration
+       timestamp/reason); malformed entries go to a quarantine report;
+    4. atomic writes throughout; restartable (idempotent on a migrated
+       store); the backup is never deleted.
+    Returns a summary dict.
+    """
+    import hashlib
+    import time as _t
+    out_legacy = out_legacy or os.path.join(
+        os.path.dirname(os.path.abspath(path)), "legacy_candidates.json")
+    out_quarantine = out_quarantine or os.path.join(
+        os.path.dirname(os.path.abspath(path)),
+        "legacy_quarantine_report.json")
+    if not os.path.exists(path):
+        return {"status": "no_store", "path": path}
+    raw_bytes = open(path, "rb").read()
+    checksum = hashlib.sha256(raw_bytes).hexdigest()
+    backup = path + f".backup.{checksum[:16]}"
+    if not dry_run and not os.path.exists(backup):
+        with open(backup, "wb") as f:
+            f.write(raw_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+    data = _load_store(path)
+    stamp = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime())
+    verified, legacy, malformed = [], [], []
+    for idx, r in enumerate(data["arrangements"]):
+        try:
+            if r.get("schema_version") == SCHEMA_VERSION and \
+                    r.get("verification_status") == "verified_exact" and \
+                    "certificate" in r:
+                if verify_certificate(
+                        certificate_from_json(r["certificate"])):
+                    verified.append(r)
+                else:
+                    r2 = dict(r)
+                    r2["_quarantine_reason"] = "failed_reverification"
+                    r2["_original_index"] = idx
+                    malformed.append(r2)
+            elif isinstance(r, dict) and "lines" in r:
+                r2 = dict(r)
+                r2["_migration"] = {
+                    "timestamp": stamp, "original_index": idx,
+                    "reason": "legacy_unverified_by_promoter",
+                    "source_checksum": checksum,
+                }
+                legacy.append(r2)
+            else:
+                malformed.append({"_original_index": idx,
+                                  "_quarantine_reason": "malformed",
+                                  "record": r})
+        except Exception as ex:
+            malformed.append({"_original_index": idx,
+                              "_quarantine_reason": f"error({ex})",
+                              "record": str(r)[:2000]})
+    summary = {
+        "source_checksum": checksum, "backup": backup,
+        "n_total": len(data["arrangements"]), "n_verified": len(verified),
+        "n_legacy": len(legacy), "n_malformed": len(malformed),
+        "dry_run": dry_run, "timestamp": stamp,
+        "already_migrated": (len(legacy) == 0 and len(malformed) == 0),
+    }
+    if dry_run:
+        return summary
+    with _FileLock(path):
+        # merge legacy candidates into any existing legacy store (restart-
+        # safe: dedup by original data key)
+        legacy_store = _load_store(out_legacy) if os.path.exists(out_legacy) \
+            else {"arrangements": [], "index": {}}
+        known = {json.dumps(r.get("lines"), sort_keys=True)
+                 for r in legacy_store["arrangements"]}
+        for r in legacy:
+            k = json.dumps(r.get("lines"), sort_keys=True)
+            if k not in known:
+                legacy_store["arrangements"].append(r)
+                known.add(k)
+        _atomic_write(legacy_store, out_legacy)
+        if malformed:
+            _atomic_write({"quarantined": malformed,
+                           "source_checksum": checksum,
+                           "timestamp": stamp}, out_quarantine)
+        new_index = {}
+        for i, r in enumerate(verified):
+            legacy_key = f"{tuple(sorted(r['lines']))}|" \
+                         f"{tuple(r.get('exponents', []))}"
+            new_index[legacy_key] = i
+        _atomic_write({"arrangements": verified, "index": new_index,
+                       "store_meta": {"contract": "verified_exact_only",
+                                      "migrated": stamp,
+                                      "source_checksum": checksum}}, path)
+    return summary
 
 
 def promote(entries, path, allow_baseline=False, reverify_existing=True):

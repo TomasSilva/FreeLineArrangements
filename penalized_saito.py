@@ -29,8 +29,11 @@ Canonical logarithmic residual.  For a line alpha and u = (f0, f1, f2) in E_d,
 
     rho_{alpha, d}(u) = (I - Pi_{alpha, d}) (a0 f0 + a1 f1 + a2 f2),
 
-where Pi_{alpha, d} is the BW-orthogonal projector of S_d onto alpha*S_{d-1}
-(Pi_{alpha, 0} = 0).  Stacking over the n lines with weight 1/sqrt(n) gives
+where Pi_{alpha, d} is the BW-orthogonal projector of S_d onto alpha*S_{d-1}.
+Degree-zero boundary (part of the DEFINITION, not only the proof note):
+S_{-1} = {0}, mu_{alpha,0}: {0} -> S_0 is the zero map, and Pi_{alpha,0}=0,
+so rho_{alpha,0}(u) = u(alpha) itself; every statement includes d = 0.
+Stacking over the n lines with weight 1/sqrt(n) gives
 
     L_{A, d} = (1/sqrt(n)) (+)_i rho_{alpha_i, d},      ker L_{A, d} = D(A)_d.
 
@@ -164,7 +167,7 @@ DEFAULT_BETA = 0.75
 # 2.0.0 = 2026-08-16 migration; 2.1.0 = 2026-08 audit (beta 0.75 default,
 # explicit branches); 2.2.0 = production-safety pass (raw-Gamma recording,
 # calibrated clipping, provenance).
-FUNCTIONAL_VERSION = "2.3.0"
+FUNCTIONAL_VERSION = "2.4.0"
 
 # Numerical-status values for Gamma evaluations (production-safety pass).
 GAMMA_OK = "OK"
@@ -182,12 +185,13 @@ class GammaNumericalError(ArithmeticError):
 def _gamma_error_tolerance(dtype, n_out, dim_u, dim_v):
     """Scale-aware forward-error tolerance for the Gamma quotient.
 
-    The numerator/denominator are sums of O(N_out) and O(dim) products;
-    a standard forward-error model bounds the relative error of the
-    quotient by ~ (number of accumulated operations) * eps, with a safety
-    factor.  Near 1 in float64 the machine spacing is ~2.22e-16; the
-    tolerance is therefore dimension- and dtype-dependent, NOT a fixed
-    constant.
+    ENGINEERING POLICY, not a proven forward-error bound: the numerator and
+    denominator are sums of O(N_out) and O(dim) products, so the tolerance
+    scales as (accumulated operations) * eps(dtype) with a safety factor of
+    64.  Near 1 in float64 the machine spacing is ~2.22e-16; the resulting
+    tolerance (~1e-11 at typical sizes) is dimension- and dtype-dependent,
+    never a fixed constant.  Values beyond it are escalated to the
+    compensated and then arbitrary-precision stages rather than trusted.
     """
     dt = np.dtype(dtype)
     eps = np.finfo(np.float64).eps if dt.kind == "c" else np.finfo(dt).eps
@@ -347,6 +351,8 @@ class PenalizedSaitoEvaluator:
         norms = np.linalg.norm(lines, axis=1)
         if np.any(norms < 1e-300):
             raise ValueError("zero line")
+        self._raw_lines = lines.copy()   # pre-normalization inputs (for the
+                                         # arbitrary-precision rebuild path)
         self.lines = lines / norms[:, None]
         self._clip_count = 0
         self._clip_max_excess = 0.0
@@ -535,9 +541,10 @@ class PenalizedSaitoEvaluator:
         return float(r1), float(r2)
 
     def _gamma_compensated(self, u_bw, v_bw, lam, beta):
-        """Stable re-evaluation path: compensated (exact) summation of every
-        accumulated dot product via math.fsum.  Used as the retry when the
-        fast path violates [0, 1] beyond tolerance."""
+        """Stage B: compensated/high-accuracy floating summation of every
+        accumulated dot product via math.fsum (correctly-rounded sums of
+        float64 products — NOT exact arithmetic and NOT extended precision).
+        First retry when the fast path violates [0, 1] beyond tolerance."""
         import math
         B = self.B_bw(u_bw, v_bw)
         if self.iscomplex:
@@ -560,6 +567,144 @@ class PenalizedSaitoEvaluator:
         penalty = 0.0 if R == 0.0 else lam * (R ** beta)
         den = B_sq + penalty
         return (0.0 if den == 0.0 else num / den), R, B_sq, den
+
+    def _gamma_mpmath(self, u_bw, v_bw, lam, beta, dps=80):
+        """Stage C: arbitrary-precision re-evaluation of the COMPLETE
+        fixed-candidate objective with mpmath at `dps` decimal digits.
+
+        Everything is rebuilt in arbitrary precision from the model inputs
+        (raw line coefficients, candidate coordinates, the exact monomial
+        tables): line normalization, the residual operators' action L1 u and
+        L2 v via the restriction identity, q_A from the product of
+        normalized lines, B(u, v) via the multiplication tables, and finally
+        <B, q>, ||B||^2, R, R^beta, the denominator and Gamma.  No float64
+        intermediate sums are reused.  Supports the real and complex
+        conventions.  Returns (gamma, diagnostics_dict).
+        """
+        import mpmath as mp
+        with mp.workdps(dps):
+            def C(x):
+                if self.iscomplex:
+                    return mp.mpc(complex(x))
+                return mp.mpf(float(x))
+
+            def conj(x):
+                return mp.conj(x) if self.iscomplex else x
+
+            raw = self._raw_lines
+            n = self.n
+            lines = []
+            for i in range(n):
+                a = [C(raw[i, k]) for k in range(3)]
+                nrm = mp.sqrt(sum(mp.fabs(t) ** 2 for t in a))
+                lines.append([t / nrm for t in a])
+
+            d1, d2 = self.d1, self.d2
+            m1, m2 = _monoms(d1), _monoms(d2)
+            N1, N2 = len(m1), len(m2)
+            sw1 = [mp.sqrt(mp.mpf(int(round(w ** 2))))
+                   for w in _bw_sqrt_weights(d1)]
+            sw2 = [mp.sqrt(mp.mpf(int(round(w ** 2))))
+                   for w in _bw_sqrt_weights(d2)]
+            u = [C(u_bw[k]) for k in range(3 * N1)]
+            v = [C(v_bw[k]) for k in range(3 * N2)]
+            # BW coordinates -> monomial coefficients per component
+            f1 = [u[i] * sw1[i] for i in range(N1)]
+            g1 = [u[N1 + i] * sw1[i] for i in range(N1)]
+            h1 = [u[2 * N1 + i] * sw1[i] for i in range(N1)]
+            f2 = [v[i] * sw2[i] for i in range(N2)]
+            g2 = [v[N2 + i] * sw2[i] for i in range(N2)]
+            h2 = [v[2 * N2 + i] * sw2[i] for i in range(N2)]
+
+            # residuals via the restriction identity, all in mp
+            def residual_sq(d, comps, ncomp_basis):
+                total = mp.mpf(0)
+                for i in range(n):
+                    a = lines[i]
+                    # Hermitian-orthonormal kernel basis of {x: a.x = 0}
+                    # via mp Gram-Schmidt on two independent solutions
+                    if mp.fabs(a[0]) >= max(mp.fabs(a[1]), mp.fabs(a[2])):
+                        b1 = [-a[1], a[0], mp.mpf(0)]
+                        b2 = [-a[2], mp.mpf(0), a[0]]
+                    elif mp.fabs(a[1]) >= mp.fabs(a[2]):
+                        b1 = [a[1], -a[0], mp.mpf(0)]
+                        b2 = [mp.mpf(0), -a[2], a[1]]
+                    else:
+                        b1 = [a[2], mp.mpf(0), -a[0]]
+                        b2 = [mp.mpf(0), a[2], -a[1]]
+                    # algebraic-kernel check/orthonormalize (Hermitian)
+                    def dot(p, q_):
+                        return sum(p[k] * conj(q_[k]) for k in range(3))
+                    nb1 = mp.sqrt(mp.re(dot(b1, b1)))
+                    b1 = [t / nb1 for t in b1]
+                    proj = dot(b2, b1)
+                    b2 = [b2[k] - proj * b1[k] for k in range(3)]
+                    nb2 = mp.sqrt(mp.re(dot(b2, b2)))
+                    b2 = [t / nb2 for t in b2]
+                    # theta(alpha) monomial coefficients
+                    ta = [a[0] * comps[0][j] + a[1] * comps[1][j]
+                          + a[2] * comps[2][j] for j in range(ncomp_basis)]
+                    ms = _monoms(d)
+                    for p_exp in range(d + 1):
+                        lam_p = mp.mpf(0)
+                        for j, (ma, mb, mc) in enumerate(ms):
+                            coeff = mp.mpf(0)
+                            for (ii, jj, kk, bc) in \
+                                    _restriction_expansion(ma, mb, mc, p_exp):
+                                coeff += (bc * b1[0] ** ii
+                                          * b2[0] ** (ma - ii)
+                                          * b1[1] ** jj * b2[1] ** (mb - jj)
+                                          * b1[2] ** kk * b2[2] ** (mc - kk))
+                            lam_p += ta[j] * coeff
+                        total += (mp.fabs(lam_p) ** 2
+                                  / mp.binomial(d, p_exp))
+                return total / n
+
+            r1 = residual_sq(d1, (f1, g1, h1), N1)
+            r2 = residual_sq(d2, (f2, g2, h2), N2)
+            R = r1 + r2
+
+            # q_A in mp: product of normalized lines, monomial coefficients
+            qc = [mp.mpf(1)] if not self.iscomplex else [mp.mpc(1)]
+            deg = 0
+            order1 = {(1, 0, 0): 0, (0, 1, 0): 1, (0, 0, 1): 2}
+            for i in range(n):
+                ia, ib, io = _mult_table(deg, 1)
+                out = [C(0) for _ in range(len(_monoms(deg + 1)))]
+                lin = [C(0), C(0), C(0)]
+                for idx, m in enumerate(_monoms(1)):
+                    lin[idx] = lines[i][order1[m]]
+                for k in range(len(ia)):
+                    out[io[k]] += qc[ia[k]] * lin[ib[k]]
+                qc = out
+                deg += 1
+            swn = [mp.sqrt(mp.mpf(int(round(w ** 2))))
+                   for w in _bw_sqrt_weights(n)]
+            q_bw = [qc[k] / swn[k] for k in range(len(qc))]
+            qn = mp.sqrt(sum(mp.fabs(t) ** 2 for t in q_bw))
+            q_bw = [t / qn for t in q_bw]
+
+            # B(u, v) monomial coefficients via mult tables, then BW coords
+            ia, ib, io = self._table
+            sx, sy, sz = self._shift
+            Bc = [C(0) for _ in range(self.N_out)]
+            for k in range(len(ia)):
+                a_, b_, o_ = int(ia[k]), int(ib[k]), int(io[k])
+                Bc[sx[o_]] += g1[a_] * h2[b_] - h1[a_] * g2[b_]
+                Bc[sy[o_]] += -(f1[a_] * h2[b_] - h1[a_] * f2[b_])
+                Bc[sz[o_]] += f1[a_] * g2[b_] - g1[a_] * f2[b_]
+            B_bw = [Bc[k] / swn[k] for k in range(self.N_out)]
+            inner = sum(conj(q_bw[k]) * B_bw[k] for k in range(self.N_out))
+            num = mp.fabs(inner) ** 2
+            B_sq = sum(mp.fabs(t) ** 2 for t in B_bw)
+            penalty = mp.mpf(0) if R == 0 else C(lam).real * R ** C(beta).real
+            den = B_sq + penalty
+            g = mp.mpf(0) if den == 0 else num / den
+            return float(g), {
+                "dps": dps, "gamma_mp": float(g),
+                "num_mp": float(num), "B_sq_mp": float(B_sq),
+                "R_mp": float(R), "den_mp": float(den),
+            }
 
     def gamma(self, u_bw, v_bw, lam=DEFAULT_LAMBDA, beta=DEFAULT_BETA,
               return_parts=False):
@@ -593,8 +738,9 @@ class PenalizedSaitoEvaluator:
             g_raw = float(num / den)
             g = g_raw
             if not (-tol <= g_raw <= 1.0 + tol):
-                # beyond the justified forward-error tolerance: retry on the
-                # compensated (exactly-summed) path before rejecting
+                # Staged retry: (B) compensated/high-accuracy floating
+                # summation, then (C) arbitrary-precision (mpmath) rebuild
+                # of the COMPLETE objective at 80 then 160 digits.
                 retries = 1
                 self._retry_count += 1
                 g_c, R_c, Bsq_c, den_c = self._gamma_compensated(
@@ -603,14 +749,37 @@ class PenalizedSaitoEvaluator:
                     g_raw, g = float(g_c), float(g_c)
                     R, B_sq, den = R_c, Bsq_c, den_c
                     status = GAMMA_RETRY_OK
-                    message = "fast path out of tolerance; compensated " \
-                              "re-evaluation accepted"
+                    message = ("fast path out of tolerance; compensated "
+                               "floating summation accepted")
                 else:
-                    self._numerical_error_count += 1
-                    status = GAMMA_NUMERICAL_ERROR
-                    message = (f"Gamma_raw {g_raw:.6e} violates [0,1] by "
-                               f"more than tol={tol:.3e}; compensated retry "
-                               f"gave {g_c:.6e}")
+                    mp_diag = None
+                    for dps in (80, 160):
+                        retries += 1
+                        self._retry_count += 1
+                        try:
+                            g_m, mp_diag = self._gamma_mpmath(
+                                u_bw, v_bw, lam, beta, dps=dps)
+                        except Exception as ex:   # mp failure -> next stage
+                            mp_diag = {"dps": dps, "error": str(ex)}
+                            continue
+                        if -1e-30 <= g_m <= 1.0 + 1e-30:
+                            g_raw, g = float(min(max(g_m, 0.0), 1.0)), None
+                            g = g_raw
+                            R = mp_diag["R_mp"]
+                            B_sq = mp_diag["B_sq_mp"]
+                            den = mp_diag["den_mp"]
+                            status = GAMMA_RETRY_OK
+                            message = (f"arbitrary-precision ({dps} digits) "
+                                       f"re-evaluation confirmed Gamma in "
+                                       f"[0,1]")
+                            break
+                    if status != GAMMA_RETRY_OK:
+                        self._numerical_error_count += 1
+                        status = GAMMA_NUMERICAL_ERROR
+                        message = (f"Gamma_raw {g_raw:.6e} violates [0,1] "
+                                   f"beyond tol={tol:.3e}; compensated gave "
+                                   f"{g_c:.6e}; arbitrary-precision "
+                                   f"diagnostics: {mp_diag}")
             if status != GAMMA_NUMERICAL_ERROR and (g < 0.0 or g > 1.0):
                 # roundoff-sized excess only: clip into [0, 1], count it
                 excess = max(g - 1.0, -g, 0.0)
@@ -1091,8 +1260,27 @@ def penalized_saito_loss_all_pairs(arr_or_lines, lam=DEFAULT_LAMBDA,
 # Cached evaluation (keyed by canonical line subset and degree pair)
 # ─────────────────────────────────────────────────────────────────────────────
 
+import threading
+_CACHE_LOCK = threading.Lock()
 _LOSS_CACHE = {}
 _LOSS_CACHE_MAX = 200_000
+_IDENTITY_HASH = None    # lazy: source content + dependency version hash
+
+
+def _identity_hash():
+    """Combined source-content + dependency-version hash for cache keys
+    (exact evaluator identity; a commit hash alone is insufficient)."""
+    global _IDENTITY_HASH
+    if _IDENTITY_HASH is None:
+        import hashlib
+        h = hashlib.sha256(source_content_hash(".").encode())
+        for mod in ("numpy", "sympy", "scipy"):
+            try:
+                h.update(f"{mod}={__import__(mod).__version__}".encode())
+            except Exception:
+                h.update(f"{mod}=absent".encode())
+        _IDENTITY_HASH = h.hexdigest()[:16]
+    return _IDENTITY_HASH
 
 
 def _canonical_key(arr: LineArrangement):
@@ -1125,14 +1313,17 @@ def cached_penalized_loss(arr: LineArrangement, d1=None, d2=None,
     key = (_canonical_key(arr), d1, d2, float(lam), float(beta), profile,
            prof["n_restarts"], prof["n_iters"], seed,
            "real", "float64", _MM_R_FLOOR, FUNCTIONAL_VERSION,
-           "BW_orthonormal_monomial_v1")
-    hit = _LOSS_CACHE.get(key)
+           "BW_orthonormal_monomial_v1", _identity_hash())
+    with _CACHE_LOCK:
+        hit = _LOSS_CACHE.get(key)
     if hit is not None:
         return hit
+    # NUMERICAL_ERROR raises here and is therefore NEVER cached as a score
     val = penalized_saito_loss(arr, d1=d1, d2=d2, lam=lam, beta=beta,
                                profile=profile, seed=seed)
-    if len(_LOSS_CACHE) < _LOSS_CACHE_MAX:
-        _LOSS_CACHE[key] = val
+    with _CACHE_LOCK:
+        if len(_LOSS_CACHE) < _LOSS_CACHE_MAX:
+            _LOSS_CACHE[key] = val
     return val
 
 

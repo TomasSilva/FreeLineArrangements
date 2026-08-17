@@ -35,7 +35,7 @@ from penalized_saito import (DEFAULT_LAMBDA, DEFAULT_BETA, PROFILES,
                              FUNCTIONAL_VERSION)
 
 __all__ = ["calibrated_loss", "freeness_potential", "compute_tau",
-           "calibration_key"]
+           "calibration_key", "CalibrationError", "SAMPLER_VERSION"]
 
 
 def calibrated_loss(s: float, tau: float) -> float:
@@ -51,10 +51,22 @@ def freeness_potential(s: float, tau: float) -> float:
     return 1.0 - calibrated_loss(s, tau)
 
 
+class CalibrationError(RuntimeError):
+    """Calibration failed validation (nonfinite / out-of-range tau or an
+    insufficient valid cohort).  Never silently replaced by a default."""
+
+
+SAMPLER_VERSION = "generic_random_valid_v1"
+
+
 def calibration_key(n, d1, d2, lam=DEFAULT_LAMBDA, beta=DEFAULT_BETA,
-                    field="real", profile="rl"):
+                    field="real", profile="rl", n_samples=24, seed=12345,
+                    coord_range=3):
+    from penalized_saito import _identity_hash
     return (f"n{n}_d{d1}_{d2}_lam{lam}_beta{beta}_{field}_{profile}_"
-            f"fv{FUNCTIONAL_VERSION}")
+            f"s{n_samples}_seed{seed}_cr{coord_range}_"
+            f"{SAMPLER_VERSION}_fv{FUNCTIONAL_VERSION}_"
+            f"id{_identity_hash()}")
 
 
 def compute_tau(n, d1, d2, lam=DEFAULT_LAMBDA, beta=DEFAULT_BETA,
@@ -63,7 +75,10 @@ def compute_tau(n, d1, d2, lam=DEFAULT_LAMBDA, beta=DEFAULT_BETA,
     """Median raw loss over a fixed generic-arrangement calibration set for
     the exact tuple.  Deterministic for fixed arguments; cached to JSON when
     cache_path is given."""
-    key = calibration_key(n, d1, d2, lam, beta, field, profile)
+    import hashlib
+    from penalized_saito import GammaNumericalError, _identity_hash
+    key = calibration_key(n, d1, d2, lam, beta, field, profile,
+                          n_samples, seed, coord_range)
     if cache_path and os.path.exists(cache_path):
         with open(cache_path) as f:
             cache = json.load(f)
@@ -71,34 +86,56 @@ def compute_tau(n, d1, d2, lam=DEFAULT_LAMBDA, beta=DEFAULT_BETA,
             return float(cache[key]["tau"])
     from swap_search import random_valid_seed
     from penalized_saito import penalized_saito_loss
+    from novelty import canonical_lineset_key
     rng = np.random.default_rng(seed)
-    losses = []
-    while len(losses) < n_samples:
+    losses, sampled_keys = [], []
+    n_errors = 0
+    attempts = 0
+    while len(losses) < n_samples and attempts < 4 * n_samples:
+        attempts += 1
         try:
             arr = random_valid_seed(n, rng, coord_range=coord_range,
                                     nontrivial=(d1 >= 2))
         except RuntimeError:
             break
         try:
-            losses.append(penalized_saito_loss(
-                arr, d1, d2, lam=lam, beta=beta, profile=profile,
-                seed=seed))
-        except Exception:
+            val = penalized_saito_loss(arr, d1, d2, lam=lam, beta=beta,
+                                       profile=profile, seed=seed)
+        except GammaNumericalError:
+            n_errors += 1        # excluded AND counted; never in the cohort
             continue
-    if not losses:
-        raise RuntimeError("calibration set could not be built")
+        losses.append(val)
+        sampled_keys.append(canonical_lineset_key(arr))
+    # explicit validation — no silent defaults
+    min_valid = max(8, n_samples // 2)
+    if len(losses) < min_valid:
+        raise CalibrationError(
+            f"only {len(losses)} valid cohort evaluations "
+            f"(need >= {min_valid}; {n_errors} numerical errors)")
     tau = float(np.median(losses))
-    tau = max(tau, 1e-6)          # guard against a degenerate zero median
+    if not np.isfinite(tau) or not (0.0 < tau <= 1.0):
+        raise CalibrationError(f"invalid tau {tau} (must be finite in "
+                               f"(0, 1]); cohort median rejected")
+    dataset_hash = hashlib.sha256(
+        "".join(sorted(sampled_keys)).encode()).hexdigest()[:16]
+    fingerprint = {
+        "tau": tau, "n": n, "d1": d1, "d2": d2, "lambda": lam,
+        "beta": beta, "field": field, "profile": profile,
+        "sampler_version": SAMPLER_VERSION, "dataset_hash": dataset_hash,
+        "n_samples_requested": n_samples, "n_valid": len(losses),
+        "n_numerical_errors": n_errors, "sampler_seed": seed,
+        "coord_range": coord_range, "identity_hash": _identity_hash(),
+        "dtype": "float64",
+        "normalization": "BW_orthonormal_monomial_v1",
+        "losses_min": float(min(losses)),
+        "losses_max": float(max(losses)),
+    }
     if cache_path:
         cache = {}
         if os.path.exists(cache_path):
             with open(cache_path) as f:
                 cache = json.load(f)
-        cache[key] = {"tau": tau, "n_samples": len(losses),
-                      "seed": seed, "coord_range": coord_range,
-                      "losses_median": tau,
-                      "losses_min": float(min(losses)),
-                      "losses_max": float(max(losses))}
+        cache[key] = fingerprint
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
         with open(cache_path, "w") as f:
             json.dump(cache, f, indent=1)

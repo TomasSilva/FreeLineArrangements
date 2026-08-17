@@ -513,23 +513,19 @@ def saito_loss(arr, target_exponents=None, lam=DEFAULT_LAMBDA,
             return 1.0
     else:
         d1 = d2 = None
-    from penalized_saito import GammaNumericalError
-    try:
-        if cached and isinstance(arr, LineArrangement):
-            return cached_penalized_loss(arr, d1=d1, d2=d2, lam=lam,
-                                         beta=beta, profile=profile,
-                                         seed=seed)
-        return penalized_saito_loss(arr, d1=d1, d2=d2, lam=lam, beta=beta,
-                                    profile=profile, n_restarts=n_restarts,
-                                    seed=seed)
-    except GammaNumericalError as e:
-        # Production policy: a numerically invalid Gamma is never fed to the
-        # search/RL layer as a score.  The pessimistic fallback 1.0 grants
-        # zero optimism (no reward can be manufactured from it) and keeps
-        # the [0, 1] contract; the event is surfaced via a warning.
-        warnings.warn(f"saito_loss: numerical error, returning pessimistic "
-                      f"1.0 ({e})", RuntimeWarning)
-        return 1.0
+    # Production policy (final audit): a numerical evaluation failure is NOT
+    # a mathematical statement about the arrangement.  GammaNumericalError
+    # PROPAGATES to the caller — it is never converted to 1.0 or any other
+    # numeric loss here.  Callers must handle it structurally (skip/mask the
+    # action, count the error, or abort the episode); see swap_env /
+    # swap_search / environment.algebraic_score.
+    if cached and isinstance(arr, LineArrangement):
+        return cached_penalized_loss(arr, d1=d1, d2=d2, lam=lam,
+                                     beta=beta, profile=profile,
+                                     seed=seed)
+    return penalized_saito_loss(arr, d1=d1, d2=d2, lam=lam, beta=beta,
+                                profile=profile, n_restarts=n_restarts,
+                                seed=seed)
 
 
 def smooth_saito_loss(arr, target_exponents=None, n_restarts=None, n_iters=None,
@@ -621,8 +617,15 @@ def legacy_invalid_angular_score(arr, target_exponents=None, n_restarts=10,
     return float(np.clip(loss, 0.0, 1.0))
 
 
+# Count of Tier-2 numerical-evaluation failures (structured deferral: the
+# score falls back to the tier boundary 0.0, which asserts "no algebraic
+# signal", never a Saito loss value)
+_TIER2_NUMERICAL_ERRORS = 0
+
+
 def algebraic_score(arr: LineArrangement, target_exponents=None,
                     use_legacy: bool = False) -> float:
+    global _TIER2_NUMERICAL_ERRORS
     """
     Score in [-1, 1] measuring progress toward freeness.
 
@@ -670,8 +673,16 @@ def algebraic_score(arr: LineArrangement, target_exponents=None,
                 loss = legacy_invalid_angular_score(
                     arr, target_exponents=target_exponents)
             else:
-                loss = saito_loss(arr, target_exponents=target_exponents,
-                                  profile='rl', cached=True)
+                from penalized_saito import GammaNumericalError
+                try:
+                    loss = saito_loss(arr, target_exponents=target_exponents,
+                                      profile='rl', cached=True)
+                except GammaNumericalError:
+                    # numerical failure carries NO Saito information: return
+                    # the Tier-1/Tier-2 boundary value (no algebraic signal,
+                    # not a loss claim) and count the event
+                    _TIER2_NUMERICAL_ERRORS += 1
+                    return 0.0
             return 1.0 - loss
         else:
             # Dense positive signal during growth: reward progress toward target size
@@ -705,7 +716,12 @@ def algebraic_score(arr: LineArrangement, target_exponents=None,
         if use_legacy:
             loss = legacy_invalid_angular_score(arr)
         else:
-            loss = saito_loss(arr, profile='rl', cached=True)
+            from penalized_saito import GammaNumericalError
+            try:
+                loss = saito_loss(arr, profile='rl', cached=True)
+            except GammaNumericalError:
+                _TIER2_NUMERICAL_ERRORS += 1
+                return 0.0     # no algebraic signal; never a loss claim
         return 1.0 - loss  # 0 = far from free, 1 = exactly free
 
 

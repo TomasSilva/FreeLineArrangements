@@ -243,9 +243,13 @@ def main():
                 budget = {"steps": 150}
             else:
                 budget = {"steps": 1500}
-            _, bl, _ = engine_fn(seed_arr, d1, d2, ev, rng,
-                                 on_candidate=io.on_candidate, **budget)
-            best_loss_overall = min(best_loss_overall, bl)
+            try:
+                _, bl, _ = engine_fn(seed_arr, d1, d2, ev, rng,
+                                     on_candidate=io.on_candidate, **budget)
+                best_loss_overall = min(best_loss_overall, bl)
+            except RuntimeError as e:
+                print(f"  restart {restarts}: {e} — skipping seed",
+                      flush=True)
             restarts += 1
             # escalate perturbation as restarts accumulate (leave the basin)
             if restarts % len(seeds) == 0:

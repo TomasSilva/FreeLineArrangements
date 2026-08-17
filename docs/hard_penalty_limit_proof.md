@@ -20,15 +20,18 @@ the following hold for the **ideal** supremum:
    $S_{\lambda,\beta}(\mathcal A;d_1,d_2)=0$ for **every** $\lambda>0$.
 2. If $\mathcal A$ is **not** free with exponents $(1,d_1,d_2)$ — this
    includes genuinely nonfree arrangements *and* free arrangements whose
-   true exponent pair differs from $(d_1,d_2)$ — then there is a constant
-   $C_{\mathcal A}>0$ (depending on $\mathcal A$ and the pair) with
+   true exponent pair differs from $(d_1,d_2)$ — then, with the strictly positive constant
+   $C^+_{\mathcal A;d_1,d_2} := 1 + 3M_B^2(c_1^2+c_2^2+c_1^2c_2^2) > 0$
+   (depending on $\mathcal A$ and the target pair),
 
    $$S_{\lambda,\beta}(\mathcal A;d_1,d_2)\;\ge\;
-   \frac{\lambda}{C_{\mathcal A}\,2^{\,1-\beta}+\lambda}
+   \frac{\lambda}{C^+_{\mathcal A;d_1,d_2}\,2^{\,1-\beta}+\lambda}
    \;\xrightarrow[\lambda\to\infty]{}\;1,$$
 
-   and in particular $1-S_{\lambda,\beta}\le C_{\mathcal A}2^{1-\beta}/\lambda
-   = O(1/\lambda)$.
+   and in particular $1-S_{\lambda,\beta}\le C^+_{\mathcal A;d_1,d_2}2^{1-\beta}/\lambda
+   = O(1/\lambda)$.  (The proof establishes the bound with the possibly-
+   zero $C_{\mathcal A}\ge0$; adding 1 costs nothing and reconciles the
+   strict positivity in the statement.)
 
 Throughout, $L_j := L_{\mathcal A,d_j}$, $K_j := \ker L_j = D(\mathcal A)_{d_j}$,
 $R(u,v)=\|L_1u\|^2+\|L_2v\|^2$, $B(u,v)=\det M(\theta_E,u,v)$, and
@@ -46,8 +49,10 @@ $\|L_j u\|^2 \le \frac1n\sum_{i=1}^n\|u\|^2 = \|u\|^2$. So on unit spheres
 $R(u,v)\le 2$.
 
 **(P2) Cauchy–Schwarz on the numerator.** $|\langle B,q_{\mathcal A}\rangle|^2
-\le \|B\|^2\|q_{\mathcal A}\|^2=\|B\|^2$, hence always
-$\Gamma_{\lambda,\beta}(u,v)\le \dfrac{\|B\|^2}{\|B\|^2+\lambda R^\beta}$.
+\le \|B\|^2\|q_{\mathcal A}\|^2=\|B\|^2$, hence, **whenever
+$\|B\|^2+\lambda R^\beta>0$**,
+$\Gamma_{\lambda,\beta}(u,v)\le \dfrac{\|B\|^2}{\|B\|^2+\lambda R^\beta}$;
+at $B=0$ and $R=0$ the separate base-locus convention $\Gamma=0$ applies.
 
 **(P3) $B$ is a bounded bilinear map.** $E_{d_1}\times E_{d_2}\to S_n$ is
 bilinear between finite-dimensional normed spaces, so
@@ -141,12 +146,11 @@ $\square$
 Remark on $\beta=1$: the **hard-penalty limit itself also holds at
 $\beta=1$** — Step 2 with $R^\beta=R$ gives directly
 $\Gamma_{\lambda,1}\le C_{\mathcal A}/(C_{\mathcal A}+\lambda)$, hence
-$S_{\lambda,1}\ge\lambda/(C_{\mathcal A}+\lambda)\to1$. What fails at
-$\beta=1$ is the *near-base-locus continuity and compact-attainment*
-analysis used elsewhere for the fixed-$\lambda$ theory ($\|B\|^2$ and the
-penalty scale identically along $u\to K_1,v\to K_2$, so the $0/0$ locus is
-no longer repelling), which is why the production functional keeps
-$\beta<1$; for $0<\beta<1$ the near-kernel directions are harmless:
+$S_{\lambda,1}\ge\lambda/(C_{\mathcal A}+\lambda)\to1$. At $\beta=1$ the subquadratic argument no longer guarantees continuity of
+the zero extension or attainment of the supremum; these **may** fail
+($\|B\|^2$ and the penalty scale identically along $u\to K_1,v\to K_2$,
+so the $0/0$ locus is no longer repelling) — which is why the production
+functional keeps $\beta<1$; for $0<\beta<1$ the near-kernel directions are harmless:
 $\|B\|^2=O(R)$ while the penalty is $\lambda R^\beta\gg R$ as $R\to0$.
 
 ## The target-free control case
@@ -158,16 +162,21 @@ $u^*\in K_1$, $v^*\in K_2$ gives $R(u^*,v^*)=0$, and
 $B(u^*,v^*)=c\,Q_{\mathcal A}$ with $c\neq0$, so the denominator is
 $\|B\|^2>0$ and
 
-$$\Gamma_{\lambda,\beta}(u^*,v^*)
-=\frac{|c|^2\|Q\|^2\cdot\|q\|^2}{|c|^2\|Q\|^2}=1
-\quad\text{for every }\lambda>0,$$
+$$\langle B(u^*,v^*),q_{\mathcal A}\rangle=c\,\|Q_{\mathcal A}\|
+\quad\Longrightarrow\quad
+\Gamma_{\lambda,\beta}(u^*,v^*)=\frac{|c|^2\|Q_{\mathcal A}\|^2}
+{|c|^2\|Q_{\mathcal A}\|^2}=1\qquad\text{for every }\lambda>0,$$
 
 hence $S_{\lambda,\beta}(\mathcal A;d_1,d_2)=0$ for every $\lambda$. $\square$
 
 ## Scope of the numerical experiments
 
-This is a theorem about the **ideal supremum**. A finite multistart returns
-$\widehat\Gamma\le\sup\Gamma$, hence $\widehat S=1-\widehat\Gamma\ge S$.
+This is a theorem about the **ideal supremum**. For normalized feasible
+candidates rescored with the raw objective in exact arithmetic, a finite
+multistart returns $\widehat\Gamma\le\sup\Gamma$, hence
+$\widehat S=1-\widehat\Gamma\ge S$; FLOATING evaluation satisfies these
+inequalities only up to the recorded numerical tolerance (the evaluator's
+scale-aware `gamma_tolerance`).
 Numerical sweeps therefore *validate the implementation* (free controls at
 0 for all $\lambda$ when seeded with exact Saito pairs; common-candidate-
 pool monotonicity, which is exact because each fixed candidate's
@@ -181,6 +190,8 @@ constant $C_{\mathcal A}$ computed from floating singular values
 certificate; a certified bound would require interval arithmetic or exact
 rank/singular-value bounds.
 
-Verified computationally by `benchmarks/hard_penalty_limit.py` and
-`tests/test_hard_penalty_limit.py`; results under
-`results_penalized_saito/<date>/hard_penalty/`.
+The implementation was regression-tested by `benchmarks/hard_penalty_limit.py` and
+`tests/test_hard_penalty_limit.py`; results, manifest and hashes under the concrete directory
+`results_penalized_saito/2026-08-17/hard_penalty/` (sweep.json embeds the
+runtime provenance block: functional version, commit, source content hash,
+dependency versions).

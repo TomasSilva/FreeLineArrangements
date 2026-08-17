@@ -214,3 +214,7 @@ discoveries.json
 # archived legacy corpora
 legacy_corpora_*.tar.gz
 .DS_Store
+legacy_candidates.json
+discoveries.json.backup.*
+legacy_quarantine_report.json
+discoveries_staging.json

@@ -322,8 +322,8 @@ def test_calibration_preserves_action_ordering():
 
 def test_tau_deterministic_and_cached(tmp_path):
     cache = str(tmp_path / "tau.json")
-    t1 = compute_tau(9, 3, 5, n_samples=6, cache_path=cache)
-    t2 = compute_tau(9, 3, 5, n_samples=6, cache_path=cache)  # cache hit
+    t1 = compute_tau(9, 3, 5, n_samples=10, cache_path=cache)
+    t2 = compute_tau(9, 3, 5, n_samples=10, cache_path=cache)  # cache hit
     assert t1 == t2 > 0
     stored = json.load(open(cache))
     key = list(stored.keys())[0]

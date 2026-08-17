@@ -73,39 +73,57 @@ def test_two_ulp_excess_is_logged_and_safely_clipped():
         assert parts["clip_excess"] <= parts["error_tolerance"]
 
 
-def test_substantial_gamma_violation_is_numerical_error():
+def test_substantial_gamma_violation_is_numerical_error(monkeypatch):
     from certificates import certificate_to_bw_vectors
     cert = find_exact_saito_certificate(arr_from(BRAID))
     u, v = certificate_to_bw_vectors(cert)   # fully aligned point (cos^2 = 1)
     ev = PenalizedSaitoEvaluator(arr_from(BRAID), 2, 3)
-    # sabotage q to force a genuine (non-roundoff) violation: with |q| = 2
-    # the aligned point gives num ~ 4 ||B||^2 > den; the compensated retry
-    # recomputes with the same sabotaged q, so it cannot repair it
+    # sabotage q to force a genuine (non-roundoff) violation; the mpmath
+    # stage would REPAIR this (it rebuilds q from the raw lines), so also
+    # simulate arbitrary-precision failure to reach the terminal error
     ev.q = ev.q * 2.0
+
+    def _mp_fail(*a, **k):
+        raise RuntimeError("mp unavailable")
+    monkeypatch.setattr(ev, "_gamma_mpmath", _mp_fail)
     g, parts = ev.gamma(u, v, return_parts=True)
     assert g is None
     assert parts["numerical_status"] == "NUMERICAL_ERROR"
     assert parts["gamma_raw"] > 1.0 + parts["error_tolerance"]
     assert parts["gamma_bounded"] is None
-    assert parts["retries"] == 1              # compensated retry attempted
+    assert parts["retries"] >= 3          # compensated + two mp attempts
     with pytest.raises(penalized_saito.GammaNumericalError):
-        ev.gamma(u, v)                        # plain call raises, never leaks
+        ev.gamma(u, v)                    # plain call raises, never leaks
+
+
+def test_arbitrary_precision_retry_repairs_corrupted_float_state():
+    """Stage C: the mpmath rebuild reconstructs q_A, B, residuals and the
+    denominator from the model inputs, so a corrupted float64 q is REPAIRED
+    (RETRY_OK with a verified bounded value), not merely rejected."""
+    from certificates import certificate_to_bw_vectors
+    cert = find_exact_saito_certificate(arr_from(BRAID))
+    u, v = certificate_to_bw_vectors(cert)
+    ev = PenalizedSaitoEvaluator(arr_from(BRAID), 2, 3)
+    ev.q = ev.q * 2.0                     # corrupt only the float64 q
+    g, parts = ev.gamma(u, v, return_parts=True)
+    assert parts["numerical_status"] == "RETRY_OK"
+    assert "arbitrary-precision" in parts["diagnostic_message"]
+    assert 0.0 <= g <= 1.0
+    assert abs(g - 1.0) < 1e-9            # true value at the certified pair
 
 
 def test_no_invalid_score_reaches_search_layer(monkeypatch):
-    """The public saito_loss contract: 0 <= loss <= 1 always; numerical
-    errors become the pessimistic 1.0 (zero optimism), never a negative or
-    out-of-range value."""
+    """Final-audit contract: a numerical failure is NEVER converted to a
+    numeric loss (no pessimistic 1.0, no NaN).  saito_loss propagates the
+    structured error; the swap env turns it into a recorded no-op with the
+    separate numerical_failure_penalty component."""
     def _always_error(*a, **k):
         raise penalized_saito.GammaNumericalError("forced")
-    monkeypatch.setattr(penalized_saito, "penalized_saito_loss",
-                        _always_error)
     monkeypatch.setattr("saito.penalized_saito_loss", _always_error)
     monkeypatch.setattr("saito.cached_penalized_loss", _always_error)
-    with pytest.warns(RuntimeWarning, match="pessimistic"):
-        val = saito_loss(construct_supersolvable(9, 3),
-                         target_exponents=(3, 5), profile="rl", cached=True)
-    assert val == 1.0
+    with pytest.raises(penalized_saito.GammaNumericalError):
+        saito_loss(construct_supersolvable(9, 3),
+                   target_exponents=(3, 5), profile="rl", cached=True)
 
 
 def test_compensated_retry_path_can_succeed(monkeypatch):

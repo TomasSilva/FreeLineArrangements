@@ -46,6 +46,15 @@ class SwapArrangementEnv:
         # chosen before training and never changed mid-run.
         self.tau = tau
         self.eta = eta
+        # numerical-failure policy: a failed Gamma evaluation carries NO
+        # Saito loss.  The action becomes a recorded no-op with the SEPARATE
+        # named reward component `numerical_failure_penalty` (default 0);
+        # after `max_consecutive_errors` consecutive failures the episode
+        # aborts with episode_status='evaluator_error'.
+        self.numerical_failure_penalty = 0.0
+        self.max_consecutive_errors = 5
+        self.numerical_error_count = 0
+        self._consecutive_errors = 0
         self.target_n = target_n
         self.max_n = max_n or target_n
         self.d1 = d1 if d1 is not None else (target_n - 1) // 2
@@ -66,6 +75,8 @@ class SwapArrangementEnv:
     # ── helpers ─────────────────────────────────────────────────────────────
 
     def _raw_loss(self, arr):
+        """Raw penalized loss.  Raises GammaNumericalError on evaluation
+        failure — the caller handles it structurally (never a loss)."""
         return saito_loss(arr, target_exponents=(self.d1, self.d2),
                           profile='rl', cached=True)
 
@@ -142,7 +153,18 @@ class SwapArrangementEnv:
                                          coord_range=self.coord_range)
         self.t = 0
         self.done = False
-        self._phi_prev = self._phi(self.arr)
+        from penalized_saito import GammaNumericalError
+        for _ in range(4):
+            try:
+                self._phi_prev = self._phi(self.arr)
+                break
+            except GammaNumericalError:
+                self.numerical_error_count += 1
+                self.arr = perturb_k_swaps(self.arr, 1, self.rng,
+                                           coord_range=self.coord_range)
+        else:
+            raise RuntimeError("swap env reset: seed states repeatedly "
+                               "failed numerical evaluation")
         self.episode_reward = 0.0
         self._build_candidates()
         return self._obs()
@@ -174,13 +196,48 @@ class SwapArrangementEnv:
                     'best_loss': getattr(self, '_last_raw_loss', 1.0)}
             reward = -0.5
             if self.done:
-                reward += self.gamma_shaping * self._phi_prev
+                # terminal convention Phi(terminal) = 0: close the
+                # telescope for the unchanged state
+                reward += self.eta * (0.0 - self._phi_prev)
             self.episode_reward += reward
             return obs, reward, self.done, info
+        from penalized_saito import GammaNumericalError
+        try:
+            phi_new_candidate = self._phi(trial)
+        except GammaNumericalError:
+            # numerical failure: NOT a Saito loss.  Recorded no-op with the
+            # separate named penalty component; abort after too many.
+            self.numerical_error_count += 1
+            self._consecutive_errors += 1
+            if self._consecutive_errors >= self.max_consecutive_errors:
+                self.done = True
+            obs = self._obs()
+            info = {'n': len(self.arr), 't2': self.arr.b2(),
+                    'is_pencil': False, 'is_terminal': self.done,
+                    'candidate_exponents': self.arr.candidate_exponents(),
+                    'target_exponents': (self.d1, self.d2),
+                    'numerical_error': True, 'raw_loss': None,
+                    'calibrated_potential': None, 'tau': self.tau,
+                    'episode_status': ('evaluator_error' if self.done
+                                       else 'numerical_error_deferred'),
+                    'numerical_failure_penalty':
+                        -self.numerical_failure_penalty}
+            reward = -self.numerical_failure_penalty
+            self.episode_reward += reward
+            return obs, reward, self.done, info
+        self._consecutive_errors = 0
         self.arr = trial
+        phi_new = phi_new_candidate
 
-        phi_new = self._phi(self.arr)
-        reward = self.eta * (self.gamma_shaping * phi_new - self._phi_prev)
+        # Potential-based shaping with the episodic absorbing convention
+        # Phi(terminal) := 0 (Ng et al.): the final transition uses 0 for
+        # the next-state potential, so shaping telescopes over the episode
+        # and policy invariance holds for the episodic task.  phi_new is
+        # still computed and logged; it just does not enter the terminal
+        # shaping term.
+        phi_next_for_shaping = 0.0 if self.done else phi_new
+        reward = self.eta * (self.gamma_shaping * phi_next_for_shaping
+                             - self._phi_prev)
         self._phi_prev = phi_new
 
         info = {'n': len(self.arr), 't2': self.arr.b2(),
@@ -201,9 +258,6 @@ class SwapArrangementEnv:
                     info['is_free'] = True
                     info['exponents'] = (1, self.d1, self.d2)
                     info['certificate'] = True
-        if self.done:
-            # truncation: absorb the tail value via the potential itself
-            reward += self.gamma_shaping * phi_new
         self.episode_reward += reward
         if not self.done:
             self._build_candidates()
