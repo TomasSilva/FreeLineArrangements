@@ -38,8 +38,47 @@ import sympy as sp
 from sympy import Rational, Matrix, symbols
 
 from arrangement import LineArrangement, ProjectiveLine
+from quadfield import (QuadElem, QuadraticField, k_nullspace,
+                       block_matrix as _qf_block_matrix, parse_quad_token)
 
 x, y, z = symbols('x y z')
+
+
+def _field_tag(K):
+    """Certificate 'field' entry: 'QQ' or the structured quadratic tag."""
+    return 'QQ' if K is None else K.to_json()
+
+
+def _null_basis(arr, d, K):
+    """Exact kernel basis of the degree-d derivation matrix over QQ or K.
+
+    QQ: sympy Matrix.nullspace() (unchanged).  K: Weil-restriction
+    nullspace; vectors are lists of Rational/QuadElem.
+    """
+    if K is None:
+        return arr.derivation_matrix(d).nullspace()
+    return k_nullspace(arr._derivation_rows(d), K)
+
+
+def _scalar_to_sympy(v):
+    return v.to_sympy() if isinstance(v, QuadElem) else v
+
+
+def _verify_scalar(t):
+    """Exact sympy form of a certificate scalar.
+
+    NEVER nsimplify an already-exact value: nsimplify is a heuristic
+    float-matcher and can return a DIFFERENT number (e.g. it maps the
+    exact Rational 93769/301320 to 5*2**(16/99)*3**(17/198)*5**(7/22)*
+    7**(65/66)/224).  QuadElem converts exactly; exact sympy numbers pass
+    through; only non-sympy data (legacy strings/ints) goes through
+    nsimplify, where sympification of the string is exact.
+    """
+    if isinstance(t, QuadElem):
+        return t.to_sympy()
+    if getattr(t, 'is_Number', False):
+        return t
+    return sp.nsimplify(t)
 
 __all__ = [
     "find_exact_saito_certificate",
@@ -102,15 +141,14 @@ def find_exact_saito_certificate(arr: LineArrangement, target_exponents=None):
     if d1 + d2 != n - 1 or d1 < 0:
         return None
 
-    M1 = arr.derivation_matrix(d1)
-    null1 = M1.nullspace()
+    K = arr.coefficient_field()
+    null1 = _null_basis(arr, d1, K)
     if not null1:
         return None
     if d1 == d2:
         null2 = null1
     else:
-        M2 = arr.derivation_matrix(d2)
-        null2 = M2.nullspace()
+        null2 = _null_basis(arr, d2, K)
         if not null2:
             return None
 
@@ -121,7 +159,7 @@ def find_exact_saito_certificate(arr: LineArrangement, target_exponents=None):
     for v1 in null1:
         f1, g1, h1 = _vec_to_components(list(v1), monoms1)
         for v2 in null2:
-            if d1 == d2 and v1 == v2:
+            if d1 == d2 and list(v1) == list(v2):
                 continue
             f2, g2, h2 = _vec_to_components(list(v2), monoms2)
             det = sp.expand(Matrix([[x, f1, f2],
@@ -129,15 +167,20 @@ def find_exact_saito_certificate(arr: LineArrangement, target_exponents=None):
                                     [z, h1, h2]]).det())
             ratio = sp.cancel(det / Q)
             if ratio.is_number and ratio != 0:
+                if K is None:
+                    th1 = [_verify_scalar(t) for t in list(v1)]
+                    th2 = [_verify_scalar(t) for t in list(v2)]
+                else:
+                    th1, th2 = list(v1), list(v2)   # exact K scalars
                 return {
                     'd1': int(d1),
                     'd2': int(d2),
                     'c': ratio,
-                    'theta1': [sp.nsimplify(t) for t in list(v1)],
-                    'theta2': [sp.nsimplify(t) for t in list(v2)],
+                    'theta1': th1,
+                    'theta2': th2,
                     'Q': Q,
                     'lines': [line.coords for line in arr.lines],
-                    'field': 'QQ',
+                    'field': _field_tag(K),
                     'normalization': 'projective_first_nonzero_one',
                 }
     return None
@@ -180,6 +223,26 @@ def _modp_rank(M, p):
     return rank
 
 
+def _modp_nullity(M, p):
+    """GF(p) nullity of a RATIONAL sympy matrix, or None on a bad prime.
+
+    Rows are scaled to integers first (row scaling preserves the kernel);
+    a prime dividing any scaled denominator skips the computation
+    conservatively (None = no conclusion).
+    """
+    rows, cols = M.shape
+    Int = np.zeros((rows, cols), dtype=np.int64)
+    for r in range(rows):
+        dens = [sp.Rational(M[r, c]).q for c in range(cols)]
+        L = int(sp.ilcm(*dens)) if dens else 1
+        if L % p == 0:
+            return None
+        for c in range(cols):
+            v = sp.Rational(M[r, c]) * L
+            Int[r, c] = int(v) % p
+    return cols - _modp_rank(Int, p)
+
+
 def modp_nullity_reject(arr: LineArrangement, d1: int, d2: int,
                         p: int = 1000003):
     """SOUND negative freeness test via GF(p) nullity.
@@ -189,27 +252,25 @@ def modp_nullity_reject(arr: LineArrangement, d1: int, d2: int,
     the exact nullity is too, so the arrangement is not free with exponents
     (1, d1, d2).  Returns True when that sound rejection fires (checks d1;
     also d2 when different).  False means "no conclusion".
-    Rows are scaled to integers first (row scaling preserves the kernel);
-    a prime dividing any scaled denominator is skipped conservatively.
+
+    Quadratic fields: the same rejection runs on the RATIONAL Weil-
+    restriction block B = [[M0, d*M1], [M1, M0]] with the doubled bound
+    nullity_p(B) < 2 * free_dim, since nullity_Q(B) = 2 * nullity_K(M).
+    No split-prime number theory needed; soundness is inherited from the
+    rational case.
     """
+    K = arr.coefficient_field()
     for d in ((d1,) if d1 == d2 else (d1, d2)):
-        M = arr.derivation_matrix(d)
-        rows, cols = M.shape
-        Int = np.zeros((rows, cols), dtype=np.int64)
-        ok = True
-        for r in range(rows):
-            dens = [sp.Rational(M[r, c]).q for c in range(cols)]
-            L = int(sp.ilcm(*dens)) if dens else 1
-            if L % p == 0:
-                ok = False
-                break
-            for c in range(cols):
-                v = sp.Rational(M[r, c]) * L
-                Int[r, c] = int(v) % p
-        if not ok:
+        if K is None:
+            M = arr.derivation_matrix(d)
+            bound = free_module_dims(d, d1, d2)
+        else:
+            M = _qf_block_matrix(arr._derivation_rows(d), K)
+            bound = 2 * free_module_dims(d, d1, d2)
+        nullity_p = _modp_nullity(M, p)
+        if nullity_p is None:
             continue
-        nullity_p = cols - _modp_rank(Int, p)
-        if nullity_p < free_module_dims(d, d1, d2):
+        if nullity_p < bound:
             return True
     return False
 
@@ -259,29 +320,32 @@ def find_certificate_fast(arr: LineArrangement, target_exponents=None,
     if prescreen_prime and modp_nullity_reject(arr, d1, d2, prescreen_prime):
         return None, 'modp_reject'
 
-    M1 = arr.derivation_matrix(d1)
-    null1 = M1.nullspace()
+    K = arr.coefficient_field()
+    null1 = _null_basis(arr, d1, K)
     if len(null1) < free_module_dims(d1, d1, d2):
         return None, 'not_target_free'
     if d1 == d2:
         null2 = null1
     else:
-        null2 = arr.derivation_matrix(d2).nullspace()
+        null2 = _null_basis(arr, d2, K)
         if len(null2) < free_module_dims(d2, d1, d2):
             return None, 'not_target_free'
 
     monoms1 = LineArrangement._monoms(d1)
     monoms2 = LineArrangement._monoms(d2)
 
-    # exact evaluation point with Q(pt) != 0
+    # exact evaluation point with Q(pt) != 0.  Q(pt) is evaluated by the
+    # exact product of the line forms at pt (stays inside K; c = det/Q in K).
     Qpoly = sp.prod(line.linear_form() for line in arr.lines)
     pt = None
     for t in (2, 3, 5, 7, 11, 13, 17):
         cand = (Rational(1), Rational(t), Rational(t) ** 2)
-        Qv = Qpoly.subs({sp.Symbol('x'): cand[0], sp.Symbol('y'): cand[1],
-                         sp.Symbol('z'): cand[2]})
+        Qv = Rational(1)
+        for line in arr.lines:
+            a_, b_, c_ = line.coords
+            Qv = Qv * (a_ * cand[0] + b_ * cand[1] + c_ * cand[2])
         if Qv != 0:
-            pt, Qval = cand, Rational(Qv)
+            pt, Qval = cand, Qv
             break
     if pt is None:                      # pathological; fall back to slow path
         cert = find_exact_saito_certificate(arr, target_exponents=(d1, d2))
@@ -301,22 +365,28 @@ def find_certificate_fast(arr: LineArrangement, target_exponents=None,
                        + ez * (f1 * g2 - f2 * g1))
             if det_val == 0:
                 continue
-            c = Rational(det_val) / Qval
+            c = det_val / Qval          # exact in K (Rational over QQ)
             # symbolic confirmation of THIS pair only
             v1, v2 = null1[i1], null2[i2]
             ff1, gg1, hh1 = _vec_to_components(list(v1), monoms1)
             ff2, gg2, hh2 = _vec_to_components(list(v2), monoms2)
             det = sp.expand(Matrix([[x, ff1, ff2], [y, gg1, gg2],
                                     [z, hh1, hh2]]).det())
-            if sp.simplify(det - c * sp.expand(Qpoly)) != 0:
+            if sp.simplify(det - _scalar_to_sympy(c)
+                           * sp.expand(Qpoly)) != 0:
                 continue                 # should not happen; stay sound
+            if K is None:
+                th1 = [_verify_scalar(t_) for t_ in list(v1)]
+                th2 = [_verify_scalar(t_) for t_ in list(v2)]
+            else:
+                th1, th2 = list(v1), list(v2)   # exact K scalars
             cert = {
                 'd1': int(d1), 'd2': int(d2), 'c': c,
-                'theta1': [sp.nsimplify(t_) for t_ in list(v1)],
-                'theta2': [sp.nsimplify(t_) for t_ in list(v2)],
+                'theta1': th1,
+                'theta2': th2,
                 'Q': sp.expand(Qpoly),
                 'lines': [line.coords for line in arr.lines],
-                'field': 'QQ',
+                'field': _field_tag(K),
                 'normalization': 'projective_first_nonzero_one',
             }
             return cert, 'certified'
@@ -390,14 +460,37 @@ def classify_freeness(arr: LineArrangement, target_pair=None):
 
 
 def _is_exact_number(v):
-    """Exact rational data only: int, str, sympy Rational/Integer or
-    fractions.Fraction.  Floats (silent rationalization) are rejected."""
+    """Exact data only: int, str, sympy Rational/Integer, Fraction, or a
+    quadfield.QuadElem.  Floats (silent rationalization) are rejected."""
     from fractions import Fraction
     if isinstance(v, float) or isinstance(v, np.floating):
         return False
+    if isinstance(v, complex) or isinstance(v, np.complexfloating):
+        return False
+    if isinstance(v, QuadElem):
+        return True
     if isinstance(v, (int, str, Fraction)):
         return True
     return getattr(v, 'is_Rational', False) is True
+
+
+def _cert_field(cert):
+    """QuadraticField declared by a certificate, or None for QQ."""
+    return QuadraticField.from_json(cert.get('field', 'QQ'))
+
+
+def _field_consistent(cert, K):
+    """All coefficient scalars lie in the declared field."""
+    scalars = list(cert['theta1']) + list(cert['theta2']) + [cert['c']]
+    for coords in cert['lines']:
+        scalars.extend(coords)
+    for v in scalars:
+        if isinstance(v, QuadElem):
+            if K is None or v.field.d != K.d:
+                return False
+        elif isinstance(v, str) and '[' in v:
+            return False       # unparsed quadratic token reached the verifier
+    return True
 
 
 def verify_certificate(cert) -> bool:
@@ -417,6 +510,7 @@ def verify_certificate(cert) -> bool:
     ('field': 'QQ'; projective normalization by first nonzero coordinate).
     """
     try:
+        K = _cert_field(cert)
         for coords in cert['lines']:
             if len(coords) != 3 or not all(_is_exact_number(v)
                                            for v in coords):
@@ -426,10 +520,18 @@ def verify_certificate(cert) -> bool:
                 return False
         if not _is_exact_number(cert['c']):
             return False
+        if not _field_consistent(cert, K):
+            return False                  # scalars outside the declared field
         lines = [ProjectiveLine(*c) for c in cert['lines']]
     except (AssertionError, TypeError, ValueError, KeyError):
         return False                      # zero line / malformed input
     arr = LineArrangement(lines)
+    try:
+        arr_K = arr.coefficient_field()
+    except ValueError:
+        return False                      # mixed fields
+    if (arr_K is None) != (K is None) or (K and arr_K and arr_K.d != K.d):
+        return False                      # declared field must match lines
     d1, d2 = cert['d1'], cert['d2']
     n = len(arr)
     if len({l.coords for l in arr.lines}) != n:
@@ -442,14 +544,14 @@ def verify_certificate(cert) -> bool:
     N2 = len(LineArrangement._monoms(d2))
     if len(cert['theta1']) != 3 * N1 or len(cert['theta2']) != 3 * N2:
         return False    # wrong stated degree / nonhomogeneous packing
-    if all(sp.nsimplify(t) == 0 for t in cert['theta1']):
+    if all(_verify_scalar(t) == 0 for t in cert['theta1']):
         return False
-    if all(sp.nsimplify(t) == 0 for t in cert['theta2']):
+    if all(_verify_scalar(t) == 0 for t in cert['theta2']):
         return False
     monoms1 = LineArrangement._monoms(d1)
     monoms2 = LineArrangement._monoms(d2)
-    th1 = [sp.nsimplify(t) for t in cert['theta1']]
-    th2 = [sp.nsimplify(t) for t in cert['theta2']]
+    th1 = [_verify_scalar(t) for t in cert['theta1']]
+    th2 = [_verify_scalar(t) for t in cert['theta2']]
     f1, g1, h1 = _vec_to_components(th1, monoms1)
     f2, g2, h2 = _vec_to_components(th2, monoms2)
 
@@ -467,7 +569,7 @@ def verify_certificate(cert) -> bool:
 
     Q = sp.expand(sp.prod(line.linear_form() for line in arr.lines))
     det = sp.expand(Matrix([[x, f1, f2], [y, g1, g2], [z, h1, h2]]).det())
-    c_expected = sp.nsimplify(cert['c'])
+    c_expected = _verify_scalar(cert['c'])
     return sp.simplify(det - c_expected * Q) == 0 and c_expected != 0
 
 
@@ -481,11 +583,21 @@ def certificate_to_bw_vectors(cert):
     """
     from penalized_saito import _bw_sqrt_weights, _monoms
 
+    K = _cert_field(cert)
+    is_complex = K is not None and not K.is_real
+
+    def _embed(t):
+        if isinstance(t, QuadElem):
+            return t.embed()
+        if is_complex:
+            return complex(_verify_scalar(t))
+        return float(_verify_scalar(t))
+
+    dtype = np.complex128 if is_complex else np.float64
     out = []
     for key, d in (('theta1', cert['d1']), ('theta2', cert['d2'])):
         N = len(_monoms(d))
-        c = np.array([float(sp.nsimplify(t)) for t in cert[key]],
-                     dtype=np.float64)
+        c = np.array([_embed(t) for t in cert[key]], dtype=dtype)
         sw = _bw_sqrt_weights(d)
         w = np.concatenate([c[:N] / sw, c[N:2 * N] / sw, c[2 * N:] / sw])
         out.append(w / np.linalg.norm(w))
@@ -508,16 +620,43 @@ def certificate_to_json(cert):
     }
 
 
+def _parse_exact_scalar(s, K):
+    """Exact scalar from its serialized string under the declared field.
+
+    Bracket tokens '[a+bs]' (optionally '-[...]') require K.  Everything
+    else is parsed EXACTLY: Rational(s) for plain rational strings, exact
+    sympification otherwise.  nsimplify is never used here — on rationals
+    with large denominators its heuristic constant-matching can return a
+    mathematically different number.
+    """
+    if isinstance(s, str):
+        t = s.strip()
+        if t.startswith('[') and t.endswith(']'):
+            return parse_quad_token(t[1:-1], K)
+        if t.startswith('-[') and t.endswith(']'):
+            return -parse_quad_token(t[2:-1], K)
+        try:
+            return Rational(t)
+        except (TypeError, ValueError):
+            return sp.sympify(t)
+    if getattr(s, 'is_Number', False) or isinstance(s, QuadElem):
+        return s
+    return sp.sympify(s)
+
+
 def certificate_from_json(d):
+    tag = d.get('field', 'QQ')
+    K = QuadraticField.from_json(tag)
     return {
         'd1': int(d['d1']),
         'd2': int(d['d2']),
-        'c': sp.nsimplify(d['c']),
-        'field': d.get('field', 'QQ'),
+        'c': _parse_exact_scalar(d['c'], K),
+        'field': tag,
         'normalization': d.get('normalization',
                                'projective_first_nonzero_one'),
-        'theta1': [sp.nsimplify(t) for t in d['theta1']],
-        'theta2': [sp.nsimplify(t) for t in d['theta2']],
-        'Q': sp.nsimplify(d['Q']),
-        'lines': [tuple(Rational(v) for v in coords) for coords in d['lines']],
+        'theta1': [_parse_exact_scalar(t, K) for t in d['theta1']],
+        'theta2': [_parse_exact_scalar(t, K) for t in d['theta2']],
+        'Q': sp.sympify(d['Q']),
+        'lines': [tuple(_parse_exact_scalar(v, K) for v in coords)
+                  for coords in d['lines']],
     }

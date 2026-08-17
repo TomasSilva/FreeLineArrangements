@@ -148,6 +148,8 @@ class QuadElem:
     def __add__(self, other):
         o = self._lift(other)
         if o is None:
+            if isinstance(other, sp.Basic):
+                return self.to_sympy() + other    # exact escape to sympy
             return NotImplemented
         return _make(self.field, self.a + o[0], self.b + o[1])
 
@@ -159,18 +161,24 @@ class QuadElem:
     def __sub__(self, other):
         o = self._lift(other)
         if o is None:
+            if isinstance(other, sp.Basic):
+                return self.to_sympy() - other
             return NotImplemented
         return _make(self.field, self.a - o[0], self.b - o[1])
 
     def __rsub__(self, other):
         o = self._lift(other)
         if o is None:
+            if isinstance(other, sp.Basic):
+                return other - self.to_sympy()
             return NotImplemented
         return _make(self.field, o[0] - self.a, o[1] - self.b)
 
     def __mul__(self, other):
         o = self._lift(other)
         if o is None:
+            if isinstance(other, sp.Basic):
+                return self.to_sympy() * other    # exact escape to sympy
             return NotImplemented
         a1, b1, (a2, b2), d = self.a, self.b, o, self.field.d
         return _make(self.field, a1 * a2 + d * b1 * b2, a1 * b2 + b1 * a2)
@@ -186,6 +194,8 @@ class QuadElem:
     def __truediv__(self, other):
         o = self._lift(other)
         if o is None:
+            if isinstance(other, sp.Basic):
+                return self.to_sympy() / other
             return NotImplemented
         a2, b2 = o
         if b2 == 0:
@@ -197,6 +207,8 @@ class QuadElem:
     def __rtruediv__(self, other):
         o = self._lift(other)
         if o is None:
+            if isinstance(other, sp.Basic):
+                return other / self.to_sympy()
             return NotImplemented
         num = _make(self.field, o[0], o[1])
         return num * self.inverse()
