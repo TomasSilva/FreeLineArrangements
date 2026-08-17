@@ -35,26 +35,111 @@ def test_gamma_raw_recorded_and_clip_counted():
     ev = PenalizedSaitoEvaluator(arr_from(BRAID), 2, 3)
     res = ev.maximize(n_restarts=4, n_iters=40)
     p = res["parts"]
-    assert "gamma_raw" in p
-    # raw value sits within roundoff of the clipped value
-    assert abs(p["gamma_raw"] - res["gamma"]) <= penalized_saito.GAMMA_CLIP_TOL
-    assert res["gamma_clip_count"] >= 0
-    assert res["gamma_clip_max_excess"] <= penalized_saito.GAMMA_CLIP_TOL
+    tol = ev.gamma_tolerance
+    for key in ("gamma_raw", "gamma_bounded", "numerical_status",
+                "clip_applied", "clip_excess", "error_tolerance",
+                "diagnostic_message"):
+        assert key in p
+    assert p["numerical_status"] in ("OK", "ROUNDING_CLIPPED", "RETRY_OK")
+    assert 0.0 <= p["gamma_bounded"] <= 1.0
+    # raw value sits within the scale-aware tolerance of the bounded value
+    assert abs(p["gamma_raw"] - p["gamma_bounded"]) <= tol
+    assert res["gamma_clip_max_excess"] <= tol
+    assert res["numerical_error_count"] == 0
     assert res["functional_version"] == penalized_saito.FUNCTIONAL_VERSION
+    # tolerance is dtype/dimension-aware, not the old fixed 1e-9
+    assert tol == penalized_saito._gamma_error_tolerance(
+        ev.dtype, ev.N_out, ev.dim_u, ev.dim_v)
+    assert 1e-14 < tol < 1e-9
 
 
-def test_large_gamma_violation_warns_not_silently_clipped():
+def test_two_ulp_excess_is_logged_and_safely_clipped():
+    ev = PenalizedSaitoEvaluator(arr_from(BRAID), 2, 3)
+    rng = np.random.default_rng(1)
+    u = rng.standard_normal(ev.dim_u)
+    u /= np.linalg.norm(u)
+    v = rng.standard_normal(ev.dim_v)
+    v /= np.linalg.norm(v)
+    eps = np.finfo(np.float64).eps
+    # simulate a two-ulp Cauchy-Schwarz excess by inflating q by (1 + eps)
+    ev.q = ev.q * (1.0 + eps)
+    before = ev._clip_count
+    g, parts = ev.gamma(u, v, return_parts=True)
+    # value is safely inside [0, 1]; any clip that occurred was logged
+    assert 0.0 <= g <= 1.0
+    assert parts["numerical_status"] in ("OK", "ROUNDING_CLIPPED")
+    if parts["clip_applied"]:
+        assert ev._clip_count == before + 1
+        assert parts["clip_excess"] <= parts["error_tolerance"]
+
+
+def test_substantial_gamma_violation_is_numerical_error():
     from certificates import certificate_to_bw_vectors
     cert = find_exact_saito_certificate(arr_from(BRAID))
     u, v = certificate_to_bw_vectors(cert)   # fully aligned point (cos^2 = 1)
     ev = PenalizedSaitoEvaluator(arr_from(BRAID), 2, 3)
     # sabotage q to force a genuine (non-roundoff) violation: with |q| = 2
-    # the aligned point gives num ~ 4 ||B||^2 > den
+    # the aligned point gives num ~ 4 ||B||^2 > den; the compensated retry
+    # recomputes with the same sabotaged q, so it cannot repair it
     ev.q = ev.q * 2.0
-    with pytest.warns(RuntimeWarning, match="Gamma exceeded 1"):
-        g, parts = ev.gamma(u, v, return_parts=True)
-    assert parts["gamma_raw"] > 1.0 + penalized_saito.GAMMA_CLIP_TOL
-    assert g == parts["gamma_raw"]          # NOT silently clipped
+    g, parts = ev.gamma(u, v, return_parts=True)
+    assert g is None
+    assert parts["numerical_status"] == "NUMERICAL_ERROR"
+    assert parts["gamma_raw"] > 1.0 + parts["error_tolerance"]
+    assert parts["gamma_bounded"] is None
+    assert parts["retries"] == 1              # compensated retry attempted
+    with pytest.raises(penalized_saito.GammaNumericalError):
+        ev.gamma(u, v)                        # plain call raises, never leaks
+
+
+def test_no_invalid_score_reaches_search_layer(monkeypatch):
+    """The public saito_loss contract: 0 <= loss <= 1 always; numerical
+    errors become the pessimistic 1.0 (zero optimism), never a negative or
+    out-of-range value."""
+    def _always_error(*a, **k):
+        raise penalized_saito.GammaNumericalError("forced")
+    monkeypatch.setattr(penalized_saito, "penalized_saito_loss",
+                        _always_error)
+    monkeypatch.setattr("saito.penalized_saito_loss", _always_error)
+    monkeypatch.setattr("saito.cached_penalized_loss", _always_error)
+    with pytest.warns(RuntimeWarning, match="pessimistic"):
+        val = saito_loss(construct_supersolvable(9, 3),
+                         target_exponents=(3, 5), profile="rl", cached=True)
+    assert val == 1.0
+
+
+def test_compensated_retry_path_can_succeed(monkeypatch):
+    """If the fast path is out of tolerance but the compensated path is
+    valid, the evaluation succeeds with status RETRY_OK."""
+    from certificates import certificate_to_bw_vectors
+    cert = find_exact_saito_certificate(arr_from(BRAID))
+    u, v = certificate_to_bw_vectors(cert)     # aligned: g_raw ~ 1
+    ev = PenalizedSaitoEvaluator(arr_from(BRAID), 2, 3)
+    # push g_raw just above 1 + tol (tiny q inflation), then emulate a
+    # successful stable re-evaluation
+    ev.q = ev.q * (1.0 + 1e-6)
+    monkeypatch.setattr(ev, "_gamma_compensated",
+                        lambda *a, **k: (0.5, 1.0, 1.0, 2.0))
+    g, parts = ev.gamma(u, v, return_parts=True)
+    assert parts["numerical_status"] == "RETRY_OK"
+    assert g == 0.5
+    assert parts["retries"] == 1
+    assert ev._retry_count >= 1
+
+
+def test_gamma_diagnostics_survive_serialization():
+    import json as _json
+    ev = PenalizedSaitoEvaluator(arr_from(BRAID), 2, 3)
+    rng = np.random.default_rng(4)
+    u = rng.standard_normal(ev.dim_u)
+    u /= np.linalg.norm(u)
+    v = rng.standard_normal(ev.dim_v)
+    v /= np.linalg.norm(v)
+    _, parts = ev.gamma(u, v, return_parts=True)
+    round_tripped = _json.loads(_json.dumps(parts))
+    assert round_tripped["numerical_status"] == parts["numerical_status"]
+    assert round_tripped["gamma_raw"] == parts["gamma_raw"]
+    assert round_tripped["error_tolerance"] == parts["error_tolerance"]
 
 
 # ── item 7: deterministic repeated evaluation + provenance ───────────────────
@@ -73,10 +158,13 @@ def test_repeated_rl_evaluation_deterministic():
 def test_runtime_provenance_fields():
     prov = runtime_provenance(".")
     for key in ("functional_version", "code_commit", "dirty_tree",
+                "source_content_hash", "dependency_versions", "python",
                 "default_lambda", "default_beta",
-                "optimization_field_default", "gamma_clip_tol",
-                "mm_r_floor", "profiles"):
+                "optimization_field_default", "gamma_tolerance_model",
+                "mm_r_floor", "profiles", "basis_convention"):
         assert key in prov
+    assert len(prov["source_content_hash"]) == 64
+    assert prov["dependency_versions"]["numpy"] != "absent"
 
 
 # ── item 10: tiny-loss but exactly nonfree ⇒ no reward, no discovery ────────
@@ -93,7 +181,7 @@ def tiny_loss_nonfree():
     pert = LineArrangement(list(base.lines[:-1]) +
                            [ProjectiveLine(a + t, b + 2 * t, c - t)])
     cert, status = find_certificate_fast(pert, target_exponents=(3, 5))
-    assert cert is None and status in ("not_free_exact", "modp_reject")
+    assert cert is None and status in ("not_target_free", "modp_reject")
     loss = saito_loss(pert, target_exponents=(3, 5), profile="search")
     assert loss < 1e-6          # passes the heuristic gate
     return pert

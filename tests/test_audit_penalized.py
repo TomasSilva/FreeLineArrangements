@@ -205,4 +205,4 @@ def test_certification_independent_of_reward(monkeypatch):
     assert status == "certified" and verify_certificate(cert)
     cert2, status2 = find_certificate_fast(arr_from(NONFREE7),
                                            target_exponents=(3, 3))
-    assert cert2 is None and status2 in ("not_free_exact", "modp_reject")
+    assert cert2 is None and status2 in ("not_target_free", "modp_reject")

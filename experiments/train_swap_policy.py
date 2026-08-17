@@ -59,16 +59,35 @@ def main():
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--ent-coef", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--tau-mode", default="none",
+                    choices=["none", "median", "half", "double"],
+                    help="reward calibration: none = raw potential; else "
+                         "tau = generic-median (x0.5 / x2); tau is computed "
+                         "once, frozen, and recorded")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    tau = None
+    if args.tau_mode != "none":
+        from calibration import compute_tau
+        tau_med = compute_tau(args.n, args.d1, args.d2,
+                              cache_path=os.path.join(args.out, "..",
+                                                      "tau_cache.json"))
+        tau = {"median": tau_med, "half": tau_med / 2,
+               "double": tau_med * 2}[args.tau_mode]
+        print(f"calibration: tau_mode={args.tau_mode} tau={tau:.6f} "
+              f"(median={tau_med:.6f})", flush=True)
     env = SwapArrangementEnv(target_n=args.n, d1=args.d1, d2=args.d2,
                              seed=args.seed, episode_len=args.episode_len,
                              k_perturb=args.k_perturb,
-                             max_candidates=args.max_candidates)
+                             max_candidates=args.max_candidates, tau=tau)
+    with open(os.path.join(args.out, "manifest.json"), "w") as mf:
+        import penalized_saito as _ps
+        json.dump({"args": vars(args), "tau": tau,
+                   "provenance": _ps.runtime_provenance(".")}, mf, indent=1)
     model = TransformerActorCritic(max_n=args.n, mode="swap_joint")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     log_path = os.path.join(args.out, "training_log.jsonl")

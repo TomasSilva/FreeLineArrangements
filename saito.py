@@ -513,12 +513,23 @@ def saito_loss(arr, target_exponents=None, lam=DEFAULT_LAMBDA,
             return 1.0
     else:
         d1 = d2 = None
-    if cached and isinstance(arr, LineArrangement):
-        return cached_penalized_loss(arr, d1=d1, d2=d2, lam=lam, beta=beta,
-                                     profile=profile, seed=seed)
-    return penalized_saito_loss(arr, d1=d1, d2=d2, lam=lam, beta=beta,
-                                profile=profile, n_restarts=n_restarts,
-                                seed=seed)
+    from penalized_saito import GammaNumericalError
+    try:
+        if cached and isinstance(arr, LineArrangement):
+            return cached_penalized_loss(arr, d1=d1, d2=d2, lam=lam,
+                                         beta=beta, profile=profile,
+                                         seed=seed)
+        return penalized_saito_loss(arr, d1=d1, d2=d2, lam=lam, beta=beta,
+                                    profile=profile, n_restarts=n_restarts,
+                                    seed=seed)
+    except GammaNumericalError as e:
+        # Production policy: a numerically invalid Gamma is never fed to the
+        # search/RL layer as a score.  The pessimistic fallback 1.0 grants
+        # zero optimism (no reward can be manufactured from it) and keeps
+        # the [0, 1] contract; the event is surfaced via a warning.
+        warnings.warn(f"saito_loss: numerical error, returning pessimistic "
+                      f"1.0 ({e})", RuntimeWarning)
+        return 1.0
 
 
 def smooth_saito_loss(arr, target_exponents=None, n_restarts=None, n_iters=None,

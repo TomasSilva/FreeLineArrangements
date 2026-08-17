@@ -97,6 +97,14 @@ Regularity caveat: upper semicontinuity is a property of the IDEAL loss S
 evaluator returns an upper APPROXIMATION S_hat >= S whose value depends on
 initialization and budget; S_hat as a function of the arrangement need not
 inherit any semicontinuity, and no such regularity is claimed for it.
+The inequality S_hat >= S itself is exact for normalized feasible
+candidates evaluated with the exact mathematical objective; the FLOATING
+output satisfies it only up to the numerical evaluation error (bounded by
+the reported scale-aware gamma tolerance).  Evaluations whose Gamma
+violates [0, 1] beyond that tolerance are retried on a compensated
+(exactly-summed) path and otherwise rejected with an explicit
+NUMERICAL_ERROR status — the public loss never returns a value outside
+[0, 1] and never silently absorbs a substantial violation.
 
 Optimizer
 ---------
@@ -156,13 +164,35 @@ DEFAULT_BETA = 0.75
 # 2.0.0 = 2026-08-16 migration; 2.1.0 = 2026-08 audit (beta 0.75 default,
 # explicit branches); 2.2.0 = production-safety pass (raw-Gamma recording,
 # calibrated clipping, provenance).
-FUNCTIONAL_VERSION = "2.2.0"
+FUNCTIONAL_VERSION = "2.3.0"
 
-# Clip tolerance for Cauchy-Schwarz violations of Gamma <= 1.  Violations
-# up to this size are floating-point roundoff and are clipped (counted and
-# reported); anything larger indicates a genuine numerical problem and
-# raises a warning while being recorded unclipped in gamma_raw.
-GAMMA_CLIP_TOL = 1e-9
+# Numerical-status values for Gamma evaluations (production-safety pass).
+GAMMA_OK = "OK"
+GAMMA_ROUNDING_CLIPPED = "ROUNDING_CLIPPED"
+GAMMA_RETRY_OK = "RETRY_OK"              # compensated re-evaluation succeeded
+GAMMA_NUMERICAL_ERROR = "NUMERICAL_ERROR"
+
+
+class GammaNumericalError(ArithmeticError):
+    """Gamma_raw violated [0, 1] beyond the justified forward-error
+    tolerance and the compensated retry did not repair it.  The value must
+    not be used as a loss or reward."""
+
+
+def _gamma_error_tolerance(dtype, n_out, dim_u, dim_v):
+    """Scale-aware forward-error tolerance for the Gamma quotient.
+
+    The numerator/denominator are sums of O(N_out) and O(dim) products;
+    a standard forward-error model bounds the relative error of the
+    quotient by ~ (number of accumulated operations) * eps, with a safety
+    factor.  Near 1 in float64 the machine spacing is ~2.22e-16; the
+    tolerance is therefore dimension- and dtype-dependent, NOT a fixed
+    constant.
+    """
+    dt = np.dtype(dtype)
+    eps = np.finfo(np.float64).eps if dt.kind == "c" else np.finfo(dt).eps
+    ops = max(64, n_out + dim_u + dim_v)
+    return 64.0 * ops * float(eps)
 
 # Optimizer effort presets (restarts x MM sweeps).  'rl' is the hot path used
 # inside the reward; 'search' for extension pre-filtering; 'benchmark' for the
@@ -320,6 +350,9 @@ class PenalizedSaitoEvaluator:
         self.lines = lines / norms[:, None]
         self._clip_count = 0
         self._clip_max_excess = 0.0
+        self._numerical_error_count = 0
+        self._retry_count = 0
+        self._gamma_tol_cached = None
 
         self.N1 = len(_monoms(d1))
         self.N2 = len(_monoms(d2))
@@ -486,11 +519,47 @@ class PenalizedSaitoEvaluator:
 
     # ── objective ───────────────────────────────────────────────────────────
 
+    @property
+    def gamma_tolerance(self):
+        """Dtype-, dimension-, and scale-aware forward-error tolerance for
+        Gamma (see _gamma_error_tolerance)."""
+        if self._gamma_tol_cached is None:
+            self._gamma_tol_cached = _gamma_error_tolerance(
+                self.dtype, self.N_out, self.dim_u, self.dim_v)
+        return self._gamma_tol_cached
+
     def residual(self, u_bw, v_bw):
         """R(u, v) = ||L1 u||^2 + ||L2 v||^2 (tangency residual)."""
         r1 = np.linalg.norm(self.L1 @ u_bw) ** 2
         r2 = np.linalg.norm(self.L2 @ v_bw) ** 2
         return float(r1), float(r2)
+
+    def _gamma_compensated(self, u_bw, v_bw, lam, beta):
+        """Stable re-evaluation path: compensated (exact) summation of every
+        accumulated dot product via math.fsum.  Used as the retry when the
+        fast path violates [0, 1] beyond tolerance."""
+        import math
+        B = self.B_bw(u_bw, v_bw)
+        if self.iscomplex:
+            re = math.fsum((self.q.conj() * B).real.tolist())
+            im = math.fsum((self.q.conj() * B).imag.tolist())
+            num = re * re + im * im
+            B_sq = math.fsum((B.conj() * B).real.tolist())
+        else:
+            num = math.fsum((self.q * B).tolist()) ** 2
+            B_sq = math.fsum((B * B).tolist())
+        L1u = self.L1 @ u_bw
+        L2v = self.L2 @ v_bw
+        if self.iscomplex:
+            r1 = math.fsum((L1u.conj() * L1u).real.tolist())
+            r2 = math.fsum((L2v.conj() * L2v).real.tolist())
+        else:
+            r1 = math.fsum((L1u * L1u).tolist())
+            r2 = math.fsum((L2v * L2v).tolist())
+        R = r1 + r2
+        penalty = 0.0 if R == 0.0 else lam * (R ** beta)
+        den = B_sq + penalty
+        return (0.0 if den == 0.0 else num / den), R, B_sq, den
 
     def gamma(self, u_bw, v_bw, lam=DEFAULT_LAMBDA, beta=DEFAULT_BETA,
               return_parts=False):
@@ -511,45 +580,76 @@ class PenalizedSaitoEvaluator:
         else:
             penalty = lam * (R ** beta)        # tiny R: underflow-safe power
         den = B_sq + penalty
+        tol = self.gamma_tolerance
+        status = GAMMA_OK
+        clip_applied = False
+        retries = 0
+        message = ""
         if den == 0.0:
             g_raw = 0.0                        # R = 0 AND B = 0: base locus
             g = 0.0
         else:
             # includes the R = 0, B != 0 free direction (den = ||B||^2)
             g_raw = float(num / den)
-            if g_raw > 1.0:
-                # Cauchy-Schwarz gives num <= ||B||^2 <= den exactly, so any
-                # excess is floating-point rounding.  Clip ONLY roundoff-
-                # sized violations; larger ones signal a numerical bug and
-                # are surfaced, never silently absorbed.
-                excess = g_raw - 1.0
+            g = g_raw
+            if not (-tol <= g_raw <= 1.0 + tol):
+                # beyond the justified forward-error tolerance: retry on the
+                # compensated (exactly-summed) path before rejecting
+                retries = 1
+                self._retry_count += 1
+                g_c, R_c, Bsq_c, den_c = self._gamma_compensated(
+                    u_bw, v_bw, lam, beta)
+                if -tol <= g_c <= 1.0 + tol:
+                    g_raw, g = float(g_c), float(g_c)
+                    R, B_sq, den = R_c, Bsq_c, den_c
+                    status = GAMMA_RETRY_OK
+                    message = "fast path out of tolerance; compensated " \
+                              "re-evaluation accepted"
+                else:
+                    self._numerical_error_count += 1
+                    status = GAMMA_NUMERICAL_ERROR
+                    message = (f"Gamma_raw {g_raw:.6e} violates [0,1] by "
+                               f"more than tol={tol:.3e}; compensated retry "
+                               f"gave {g_c:.6e}")
+            if status != GAMMA_NUMERICAL_ERROR and (g < 0.0 or g > 1.0):
+                # roundoff-sized excess only: clip into [0, 1], count it
+                excess = max(g - 1.0, -g, 0.0)
                 self._clip_count += 1
                 if excess > self._clip_max_excess:
                     self._clip_max_excess = excess
-                if excess <= GAMMA_CLIP_TOL:
-                    g = 1.0
-                else:
-                    import warnings
-                    warnings.warn(
-                        f"Gamma exceeded 1 by {excess:.3e} > GAMMA_CLIP_TOL="
-                        f"{GAMMA_CLIP_TOL:.1e}; leaving unclipped — "
-                        f"investigate conditioning", RuntimeWarning)
-                    g = g_raw
-            else:
-                g = g_raw
-        if not return_parts:
-            return g
-        return g, {
+                g = min(max(g, 0.0), 1.0)
+                clip_applied = True
+                if status == GAMMA_OK:
+                    status = GAMMA_ROUNDING_CLIPPED
+        parts = {
             "gamma_raw": float(g_raw),
+            "gamma_bounded": (float(g) if status != GAMMA_NUMERICAL_ERROR
+                              else None),
+            "numerical_status": status,
+            "clip_applied": clip_applied,
+            "clip_excess": (float(max(g_raw - 1.0, -min(g_raw, 0.0), 0.0))
+                            if clip_applied else 0.0),
+            "error_tolerance": float(tol),
+            "diagnostic_message": message,
+            "retries": retries,
+            "raw_numerator": float(num),
             "B_norm": float(np.sqrt(B_sq)),
             "inner_abs": float(abs(inner)),
             "L1u_norm": float(np.sqrt(r1)),
             "L2v_norm": float(np.sqrt(r2)),
             "residual_R": float(R),
             "denominator": float(den),
+            "dtype": str(self.dtype),
             "lambda": float(lam),
             "beta": float(beta),
         }
+        if status == GAMMA_NUMERICAL_ERROR:
+            if return_parts:
+                return None, parts
+            raise GammaNumericalError(message)
+        if not return_parts:
+            return g
+        return g, parts
 
     def gamma_and_grad(self, u_bw, v_bw, lam=DEFAULT_LAMBDA, beta=DEFAULT_BETA):
         """Gamma and its Euclidean gradient w.r.t. (u, v).  Real dtype only.
@@ -627,6 +727,14 @@ class PenalizedSaitoEvaluator:
         rows = Vh[-m:] if Vh.shape[0] >= m else Vh
         return [r.conj() for r in rows[::-1]]
 
+    def _gamma_safe(self, u_bw, v_bw, lam, beta):
+        """Gamma for optimizer-internal comparisons: numerical errors rank
+        strictly below every valid value instead of propagating."""
+        try:
+            return self.gamma(u_bw, v_bw, lam, beta)
+        except GammaNumericalError:
+            return -1.0
+
     def _kernel_pair_inits(self, lam, beta, m=2):
         ku = self._near_kernel_vectors(self.L1, m)
         kv = (ku if self.L2 is self.L1 else
@@ -637,7 +745,7 @@ class PenalizedSaitoEvaluator:
                 if self.L2 is self.L1 and \
                         abs(abs(np.vdot(uu, vv)) - 1.0) < 1e-12:
                     continue   # same vector twice -> B = 0 identically
-                scored.append((self.gamma(uu, vv, lam, beta), uu, vv))
+                scored.append((self._gamma_safe(uu, vv, lam, beta), uu, vv))
         scored.sort(key=lambda t: -t[0])
         return [(u, v, "kernel") for (_, u, v) in scored[:2]]
 
@@ -720,7 +828,7 @@ class PenalizedSaitoEvaluator:
             nu, nv = np.linalg.norm(u_t), np.linalg.norm(v_t)
             if nu > 0 and nv > 0:
                 u_t, v_t = u_t / nu, v_t / nv
-                g_t = self.gamma(u_t, v_t, lam, beta)
+                g_t = self._gamma_safe(u_t, v_t, lam, beta)
                 if g_t >= g0 - 1e-15:
                     return u_t, v_t, g_t, t
             t *= 0.5
@@ -748,7 +856,7 @@ class PenalizedSaitoEvaluator:
         records = []
         for u0, v0, kind in inits:
             u, v = u0.copy(), v0.copy()
-            g = self.gamma(u, v, lam, beta)
+            g = self._gamma_safe(u, v, lam, beta)
             stop = "max_iters"
             it_done = 0
             for it in range(n_iters):
@@ -788,9 +896,23 @@ class PenalizedSaitoEvaluator:
 
         g_best, u_best, v_best = best
         gs = np.array([r["gamma"] for r in records])
+        if u_best is None or g_best < 0.0:
+            # every restart hit a numerical error: no valid score exists
+            return {
+                "status": "numerical_error", "loss": None, "gamma": None,
+                "restarts": records, "lambda": float(lam),
+                "beta": float(beta),
+                "numerical_error_count": self._numerical_error_count,
+                "retry_count": self._retry_count,
+                "gamma_tolerance": self.gamma_tolerance,
+                "optimization_field": ("complex" if self.iscomplex
+                                       else "real"),
+                "functional_version": FUNCTIONAL_VERSION,
+            }
         g_best = float(max(g_best, 0.0))
         _, parts = self.gamma(u_best, v_best, lam, beta, return_parts=True)
         out = {
+            "status": "ok",
             "loss": float(min(max(1.0 - g_best, 0.0), 1.0)),
             "gamma": g_best,
             "gamma_median": float(np.median(gs)),
@@ -811,10 +933,13 @@ class PenalizedSaitoEvaluator:
                                 else "differentiable"),
             "mm_r_floor": _MM_R_FLOOR,
             "functional_version": FUNCTIONAL_VERSION,
-            # clipping accounting for THIS evaluator instance (item: verify
+            # clipping/error accounting for THIS evaluator instance (verify
             # clipping is roundoff bookkeeping, not value manufacturing)
             "gamma_clip_count": self._clip_count,
             "gamma_clip_max_excess": self._clip_max_excess,
+            "numerical_error_count": self._numerical_error_count,
+            "retry_count": self._retry_count,
+            "gamma_tolerance": self.gamma_tolerance,
         }
         if not self.iscomplex:
             try:
@@ -922,6 +1047,11 @@ def penalized_saito_loss(arr_or_lines, d1=None, d2=None,
     ev = PenalizedSaitoEvaluator(lines, d1, d2, dtype=dtype)
     res = ev.maximize(lam=lam, beta=beta, n_restarts=n_restarts,
                       n_iters=n_iters, seed=seed, warm_starts=warm_starts)
+    if res.get("status") == "numerical_error":
+        # the public loss NEVER returns an out-of-[0,1] or fabricated value
+        raise GammaNumericalError(
+            f"all restarts hit numerical errors for pair ({d1},{d2}); "
+            f"no valid score (errors={res['numerical_error_count']})")
     res["d1"], res["d2"] = d1, d2
     return (res["loss"], res) if return_details else res["loss"]
 
@@ -984,7 +1114,18 @@ def cached_penalized_loss(arr: LineArrangement, d1=None, d2=None,
             d1 = d2 = None
         else:
             d1, d2 = exps
-    key = (_canonical_key(arr), d1, d2, float(lam), float(beta), profile, seed)
+    # Complete cache key (production-safety audit): canonical exact line
+    # configuration (order- and per-line-scaling-quotiented; NEVER GL/PGL-
+    # identified), target pair, lambda, beta, field/dtype, full optimizer
+    # budget, seed policy, solver floor, functional version, basis
+    # convention.  Concurrency: per-process dict (workers fork with
+    # independent caches); bitwise repeatability is claimed only within the
+    # environment recorded by runtime_provenance().
+    prof = PROFILES[profile]
+    key = (_canonical_key(arr), d1, d2, float(lam), float(beta), profile,
+           prof["n_restarts"], prof["n_iters"], seed,
+           "real", "float64", _MM_R_FLOOR, FUNCTIONAL_VERSION,
+           "BW_orthonormal_monomial_v1")
     hit = _LOSS_CACHE.get(key)
     if hit is not None:
         return hit
@@ -999,9 +1140,29 @@ def clear_cache():
     _LOSS_CACHE.clear()
 
 
+def source_content_hash(repo_root="."):
+    """SHA-256 over the bytes of the mathematical core source files —
+    exact-reproducibility identifier (a commit + dirty flag is not enough;
+    this pins the actual code content in use)."""
+    import hashlib
+    import os
+    h = hashlib.sha256()
+    for fname in ("penalized_saito.py", "certificates.py", "arrangement.py",
+                  "swap_search.py"):
+        path = os.path.join(repo_root, fname)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                h.update(fname.encode())
+                h.update(f.read())
+    return h.hexdigest()
+
+
 def runtime_provenance(repo_root="."):
     """Provenance block for manifests/logs: code commit, dirty-tree state,
-    functional version, defaults, field convention."""
+    source content hash, dependency versions, functional version, defaults,
+    tolerance model, field convention.  Bitwise repeatability is claimed
+    only within an environment matching this record, not across platforms.
+    """
     import subprocess
     try:
         rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root,
@@ -1012,14 +1173,26 @@ def runtime_provenance(repo_root="."):
                                     text=True, timeout=10).stdout.strip())
     except Exception:
         rev, dirty = "unknown", None
+    deps = {}
+    for mod in ("numpy", "sympy", "scipy", "networkx"):
+        try:
+            deps[mod] = __import__(mod).__version__
+        except Exception:
+            deps[mod] = "absent"
+    import platform
     return {
         "functional_version": FUNCTIONAL_VERSION,
         "code_commit": rev,
         "dirty_tree": dirty,
+        "source_content_hash": source_content_hash(repo_root),
+        "dependency_versions": deps,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
         "default_lambda": DEFAULT_LAMBDA,
         "default_beta": DEFAULT_BETA,
         "optimization_field_default": "real",
-        "gamma_clip_tol": GAMMA_CLIP_TOL,
+        "gamma_tolerance_model": "64*max(64, N_out+dim_u+dim_v)*eps(dtype)",
         "mm_r_floor": _MM_R_FLOOR,
         "profiles": PROFILES,
+        "basis_convention": "BW_orthonormal_monomial_v1",
     }

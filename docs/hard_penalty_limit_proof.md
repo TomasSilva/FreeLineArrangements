@@ -1,7 +1,14 @@
 # The hard-penalty limit of the penalized Saito functional
 
 **Theorem.** Fix a line arrangement $\mathcal A$ of $n$ distinct lines, a
-degree pair $(d_1,d_2)$ with $d_1+d_2=n-1$, $d_1\ge 0$, and $0<\beta<1$.
+target degree pair with $d_1\ge 0$, $d_2\ge 0$, $d_1+d_2=n-1$ — treated as
+an **unordered** pair, normalized throughout by the convention $d_1\le d_2$
+— and $0<\beta<1$.
+
+*Degree-zero boundary.* $S_{-1}=\{0\}$, so $\mu_{\alpha,0}\colon\{0\}\to
+S_0$ is the zero map, $\alpha S_{-1}=\{0\}$, and $\Pi_{\alpha,0}=0$: the
+degree-0 residual is $\rho_{\alpha,0}(u)=u(\alpha)$ itself. All statements
+below include $d_1=0$.
 With the Bombieri–Weyl normalizations of `penalized_saito.py`,
 
 $$S_{\lambda,\beta}(\mathcal A; d_1,d_2)\;=\;1-\sup_{\|u\|=\|v\|=1}
@@ -46,14 +53,15 @@ $\Gamma_{\lambda,\beta}(u,v)\le \dfrac{\|B\|^2}{\|B\|^2+\lambda R^\beta}$.
 bilinear between finite-dimensional normed spaces, so
 $M_B:=\sup_{\|u\|=\|v\|=1}\|B(u,v)\|<\infty$.
 
-**(P4) Smallest positive singular values.** $L_j$ is a linear map between
-finite-dimensional inner-product spaces; let $\sigma_j>0$ denote its
-smallest **positive** singular value and $c_j:=1/\sigma_j=\|L_j^\dagger\|$.
-For the orthogonal decomposition $u=u_K+u_\perp$ with $u_K\in K_j$,
-$u_\perp\in K_j^\perp$, one has $\|L_j u\|=\|L_j u_\perp\|\ge
-\sigma_j\|u_\perp\|$, i.e. $\|u_\perp\|\le c_j\|L_j u\|$. (If $L_j$ is
-injective, $K_j=\{0\}$ and $u_\perp=u$; if $L_j=0$ the arrangement case
-below does not occur since then every $u$ is logarithmic.)
+**(P4) Pseudoinverse constants.** $L_j$ is a linear map between
+finite-dimensional inner-product spaces; define uniformly
+$c_j:=\|L_j^\dagger\|$ (the Moore–Penrose pseudoinverse norm; when
+$L_j\neq0$ this equals $1/\sigma^+_{\min}(L_j)$, and when $L_j=0$ the
+standard convention $L_j^\dagger=0$ gives $c_j=0$). For the orthogonal
+decomposition $u=u_K+u_\perp$ with $u_K\in K_j$, $u_\perp\in K_j^\perp$,
+one has $\|u_\perp\|=\|L_j^\dagger L_j u\|\le c_j\|L_j u\|$; if $L_j=0$
+then $K_j^\perp=\{0\}$, $u_\perp=0$, and the estimate holds trivially.
+(If $L_j$ is injective, $K_j=\{0\}$ and $u_\perp=u$.)
 
 ## Step 1: $B(K_1,K_2)=\{0\}$ in the non-target-free case
 
@@ -65,7 +73,8 @@ $\alpha_i=0$ in $\mathbb C^3$, the three coefficient rows of
 $M(\theta_E,u,v)$ become everywhere tangent to that 2-dimensional plane,
 hence linearly dependent along it, so $\alpha_i\mid B(u,v)$. As the
 $\alpha_i$ are pairwise non-proportional, $Q_{\mathcal A}\mid B(u,v)$.
-Since $\deg B(u,v)=1+d_1+d_2=n=\deg Q_{\mathcal A}$, there is a scalar $c$
+Now $B(u,v)\in S_n$ **and may be zero**: since $Q_{\mathcal A}$ divides
+$B(u,v)$ and both lie in $S_n$, there is a scalar $c$ — possibly $c=0$ —
 with
 
 $$B(u,v)=c\,Q_{\mathcal A}.$$
@@ -79,7 +88,10 @@ Hence $c=0$ and $B$ vanishes identically on $K_1\times K_2$. $\square$
 
 ## Step 2: the residual controls the determinant
 
-Claim: with $C_{\mathcal A}:=3M_B^2\,(c_1^2+c_2^2+c_1^2c_2^2)$,
+Claim: with the **finite** constant
+$C_{\mathcal A}:=3M_B^2\,(c_1^2+c_2^2+c_1^2c_2^2)\ge 0$
+(positivity is unnecessary for the limit; $C_{\mathcal A}=0$ only makes the
+bound stronger),
 
 $$\|B(u,v)\|^2\;\le\;C_{\mathcal A}\,R(u,v)\qquad\text{on }\|u\|=\|v\|=1.$$
 
@@ -126,12 +138,16 @@ S_{\lambda,\beta}\ge\frac{\lambda}{C_{\mathcal A}2^{1-\beta}+\lambda}
 with rate $1-S_{\lambda,\beta}\le C_{\mathcal A}2^{1-\beta}/\lambda$.
 $\square$
 
-Note where $\beta<1$ enters: it is what makes the *near-kernel* directions
-harmless. Along $u\to K_1, v\to K_2$ one has $\|B\|^2=O(R)$ while the
-penalty is $\lambda R^\beta \gg R$; at $\beta=1$ the two scale identically
-and the bound degenerates ($\Gamma\le C_{\mathcal A}/(C_{\mathcal A}+\lambda)$
-still holds, but attainment analysis at the base locus fails — one reason
-$\beta=1$ is not the reported loss).
+Remark on $\beta=1$: the **hard-penalty limit itself also holds at
+$\beta=1$** — Step 2 with $R^\beta=R$ gives directly
+$\Gamma_{\lambda,1}\le C_{\mathcal A}/(C_{\mathcal A}+\lambda)$, hence
+$S_{\lambda,1}\ge\lambda/(C_{\mathcal A}+\lambda)\to1$. What fails at
+$\beta=1$ is the *near-base-locus continuity and compact-attainment*
+analysis used elsewhere for the fixed-$\lambda$ theory ($\|B\|^2$ and the
+penalty scale identically along $u\to K_1,v\to K_2$, so the $0/0$ locus is
+no longer repelling), which is why the production functional keeps
+$\beta<1$; for $0<\beta<1$ the near-kernel directions are harmless:
+$\|B\|^2=O(R)$ while the penalty is $\lambda R^\beta\gg R$ as $R\to0$.
 
 ## The target-free control case
 

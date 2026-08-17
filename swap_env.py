@@ -39,7 +39,13 @@ class SwapArrangementEnv:
     def __init__(self, target_n=12, d1=None, d2=None, coord_range=3,
                  max_candidates=64, episode_len=None, k_perturb=2,
                  gamma_shaping=0.99, seed=0, seed_mode="perturbed",
-                 certify_below=1e-3, max_n=None):
+                 certify_below=1e-3, max_n=None, tau=None, eta=1.0):
+        # tau: optional FROZEN calibration constant (calibration.py).  When
+        # set, the shaping potential is 1 - calibrated_loss(raw; tau); the
+        # RAW loss is always logged alongside (info['raw_loss']).  tau is
+        # chosen before training and never changed mid-run.
+        self.tau = tau
+        self.eta = eta
         self.target_n = target_n
         self.max_n = max_n or target_n
         self.d1 = d1 if d1 is not None else (target_n - 1) // 2
@@ -59,9 +65,17 @@ class SwapArrangementEnv:
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
+    def _raw_loss(self, arr):
+        return saito_loss(arr, target_exponents=(self.d1, self.d2),
+                          profile='rl', cached=True)
+
     def _phi(self, arr):
-        return 1.0 - saito_loss(arr, target_exponents=(self.d1, self.d2),
-                                profile='rl', cached=True)
+        s = self._raw_loss(arr)
+        self._last_raw_loss = s
+        if self.tau is not None:
+            from calibration import freeness_potential
+            return freeness_potential(s, self.tau)
+        return 1.0 - s
 
     def _build_candidates(self):
         """Candidate L+ list for the CURRENT arrangement: top singularity
@@ -155,7 +169,9 @@ class SwapArrangementEnv:
                     'candidate_exponents': self.arr.candidate_exponents(),
                     'target_exponents': (self.d1, self.d2),
                     'invalid_swap': True,
-                    'best_loss': 1.0 - self._phi_prev}
+                    'raw_loss': getattr(self, '_last_raw_loss', 1.0),
+                    'tau': self.tau,
+                    'best_loss': getattr(self, '_last_raw_loss', 1.0)}
             reward = -0.5
             if self.done:
                 reward += self.gamma_shaping * self._phi_prev
@@ -164,16 +180,18 @@ class SwapArrangementEnv:
         self.arr = trial
 
         phi_new = self._phi(self.arr)
-        reward = self.gamma_shaping * phi_new - self._phi_prev
+        reward = self.eta * (self.gamma_shaping * phi_new - self._phi_prev)
         self._phi_prev = phi_new
 
         info = {'n': len(self.arr), 't2': self.arr.b2(),
                 'is_pencil': False, 'is_terminal': self.done,
                 'candidate_exponents': self.arr.candidate_exponents(),
                 'target_exponents': (self.d1, self.d2),
-                'best_loss': 1.0 - phi_new}
+                'raw_loss': self._last_raw_loss,
+                'calibrated_potential': phi_new, 'tau': self.tau,
+                'best_loss': self._last_raw_loss}
         # exact certification gate (never granted by the numerical loss)
-        if 1.0 - phi_new < self.certify_below:
+        if self._last_raw_loss < self.certify_below:
             key = canonical_lineset_key(self.arr)
             if key not in self.certified_keys:
                 self.certified_keys.add(key)

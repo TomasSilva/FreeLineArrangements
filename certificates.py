@@ -44,13 +44,25 @@ x, y, z = symbols('x y z')
 __all__ = [
     "find_exact_saito_certificate",
     "find_certificate_fast",
+    "classify_freeness",
     "free_module_dims",
     "modp_nullity_reject",
     "verify_certificate",
     "certificate_to_bw_vectors",
     "certificate_to_json",
     "certificate_from_json",
+    "FREE_TARGET", "NOT_TARGET_FREE", "GLOBALLY_NONFREE", "UNRESOLVED",
+    "NUMERICAL_ERROR",
 ]
+
+# Structured freeness statuses.  None is never used to encode an outcome.
+FREE_TARGET = "FREE_TARGET"            # exact certificate for the pair
+NOT_TARGET_FREE = "NOT_TARGET_FREE"    # C = 0 for the PRESCRIBED pair only:
+#   proves no Saito basis with these degrees exists.  It does NOT prove
+#   global nonfreeness — a free arrangement at a wrong pair also has C = 0.
+GLOBALLY_NONFREE = "GLOBALLY_NONFREE"  # exact two-branch argument (below)
+UNRESOLVED = "UNRESOLVED"              # timeout / incomplete computation
+NUMERICAL_ERROR = "NUMERICAL_ERROR"    # evaluation failure; never a proof
 
 
 def _vec_to_components(vec, monoms):
@@ -125,6 +137,8 @@ def find_exact_saito_certificate(arr: LineArrangement, target_exponents=None):
                     'theta2': [sp.nsimplify(t) for t in list(v2)],
                     'Q': Q,
                     'lines': [line.coords for line in arr.lines],
+                    'field': 'QQ',
+                    'normalization': 'projective_first_nonzero_one',
                 }
     return None
 
@@ -229,7 +243,7 @@ def find_certificate_fast(arr: LineArrangement, target_exponents=None,
     negative: if it were free, some basis pair would have c != 0).
 
     Returns (cert_dict, status) with status in
-    {'certified', 'not_free_exact', 'modp_reject', 'no_exponents'}.
+    {'certified', 'not_target_free', 'modp_reject', 'no_exponents'}.
     """
     if target_exponents is None:
         exps = arr.candidate_exponents()
@@ -248,13 +262,13 @@ def find_certificate_fast(arr: LineArrangement, target_exponents=None,
     M1 = arr.derivation_matrix(d1)
     null1 = M1.nullspace()
     if len(null1) < free_module_dims(d1, d1, d2):
-        return None, 'not_free_exact'
+        return None, 'not_target_free'
     if d1 == d2:
         null2 = null1
     else:
         null2 = arr.derivation_matrix(d2).nullspace()
         if len(null2) < free_module_dims(d2, d1, d2):
-            return None, 'not_free_exact'
+            return None, 'not_target_free'
 
     monoms1 = LineArrangement._monoms(d1)
     monoms2 = LineArrangement._monoms(d2)
@@ -271,7 +285,7 @@ def find_certificate_fast(arr: LineArrangement, target_exponents=None,
             break
     if pt is None:                      # pathological; fall back to slow path
         cert = find_exact_saito_certificate(arr, target_exponents=(d1, d2))
-        return (cert, 'certified') if cert else (None, 'not_free_exact')
+        return (cert, 'certified') if cert else (None, 'not_target_free')
 
     evals1 = [_eval_components(list(v), monoms1, pt) for v in null1]
     evals2 = (evals1 if d1 == d2 else
@@ -302,31 +316,136 @@ def find_certificate_fast(arr: LineArrangement, target_exponents=None,
                 'theta2': [sp.nsimplify(t_) for t_ in list(v2)],
                 'Q': sp.expand(Qpoly),
                 'lines': [line.coords for line in arr.lines],
+                'field': 'QQ',
+                'normalization': 'projective_first_nonzero_one',
             }
             return cert, 'certified'
-    return None, 'not_free_exact'
+    return None, 'not_target_free'
+
+
+def classify_freeness(arr: LineArrangement, target_pair=None):
+    """Structured exact freeness classification.
+
+    Returns {'status', 'evidence', 'certificate', 'candidate_pair'} with
+    status in {FREE_TARGET, NOT_TARGET_FREE, GLOBALLY_NONFREE, UNRESOLVED}.
+
+    With a target pair: FREE_TARGET (exact certificate) or NOT_TARGET_FREE
+    (exact C = 0 for that pair — which does NOT prove global nonfreeness).
+
+    Without a target pair, the exact two-branch global argument:
+      (1) the characteristic polynomial chi(A, t)/(t-1) is computed exactly
+          from the intersection lattice; if it does not factor as
+          (t - e1)(t - e2) with admissible nonnegative integers, the
+          arrangement is GLOBALLY_NONFREE by the contrapositive of Terao's
+          factorization theorem;
+      (2) if it factors, the exponents of any free structure are FORCED to
+          be the unique unordered candidate pair (e1, e2); the exact
+          determinant-pair matrix C for that pair then decides:
+          C != 0 -> FREE_TARGET (for the candidate pair);
+          C == 0 -> GLOBALLY_NONFREE.
+    Any exception/timeout yields UNRESOLVED — never treated as a proof.
+
+    Point-evaluation preconditions (all enforced by construction in
+    find_certificate_fast): v_i, w_j are exact null-space vectors, hence
+    exactly logarithmic; d1 + d2 = n - 1; the divisibility theorem gives
+    B(v_i, w_j) = c Q identically; the evaluation point p is exact rational
+    with Q(p) != 0; all arithmetic is exact over the declared field (QQ).
+    """
+    try:
+        if target_pair is not None:
+            cert, status = find_certificate_fast(arr,
+                                                 target_exponents=target_pair)
+            if status == 'certified':
+                return {'status': FREE_TARGET, 'certificate': cert,
+                        'candidate_pair': tuple(target_pair),
+                        'evidence': 'exact_saito_certificate'}
+            if status in ('not_target_free', 'modp_reject'):
+                return {'status': NOT_TARGET_FREE, 'certificate': None,
+                        'candidate_pair': tuple(target_pair),
+                        'evidence': f'exact_pair_matrix_zero({status})'}
+            return {'status': UNRESOLVED, 'certificate': None,
+                    'candidate_pair': tuple(target_pair),
+                    'evidence': f'inadmissible_or_incomplete({status})'}
+        exps = arr.candidate_exponents()
+        if exps is None:
+            return {'status': GLOBALLY_NONFREE, 'certificate': None,
+                    'candidate_pair': None,
+                    'evidence': 'terao_factorization_obstruction'}
+        cert, status = find_certificate_fast(arr, target_exponents=exps)
+        if status == 'certified':
+            return {'status': FREE_TARGET, 'certificate': cert,
+                    'candidate_pair': tuple(exps),
+                    'evidence': 'exact_saito_certificate'}
+        if status in ('not_target_free', 'modp_reject'):
+            return {'status': GLOBALLY_NONFREE, 'certificate': None,
+                    'candidate_pair': tuple(exps),
+                    'evidence': ('exponents_forced_by_terao_and_'
+                                 f'pair_matrix_zero({status})')}
+        return {'status': UNRESOLVED, 'certificate': None,
+                'candidate_pair': tuple(exps),
+                'evidence': f'incomplete({status})'}
+    except Exception as e:            # noqa: BLE001 — never a nonfree proof
+        return {'status': UNRESOLVED, 'certificate': None,
+                'candidate_pair': None, 'evidence': f'exception({e})'}
+
+
+def _is_exact_number(v):
+    """Exact rational data only: int, str, sympy Rational/Integer or
+    fractions.Fraction.  Floats (silent rationalization) are rejected."""
+    from fractions import Fraction
+    if isinstance(v, float) or isinstance(v, np.floating):
+        return False
+    if isinstance(v, (int, str, Fraction)):
+        return True
+    return getattr(v, 'is_Rational', False) is True
 
 
 def verify_certificate(cert) -> bool:
     """Re-verify a certificate from scratch, exactly over Q.
 
     A valid certificate requires ALL of:
-      (0) exactly n pairwise-distinct projective lines with d1 + d2 = n - 1,
-          d1 >= 0;
-      (1) theta_1, theta_2 logarithmic: alpha_i | theta(alpha_i) exactly for
-          every line and both derivations (coefficients in the S_{d1}/S_{d2}
-          monomial bases, so the stated degrees bound the actual degrees);
-      (2) det M(theta_E, theta_1, theta_2) = c * Q exactly, with c != 0
-          (which also forces both derivations to be nonzero).
+      (0) every line triple exact (no floats) and nonzero; exactly n
+          pairwise non-proportional projective lines (n recomputed from the
+          list); d1 <= d2 nonnegative integers with d1 + d2 = n - 1;
+      (1) theta_1, theta_2 given by exact stacked coefficient vectors of the
+          exact lengths 3*dim S_{d1} / 3*dim S_{d2} (hence homogeneous of
+          exactly the stated degrees when nonzero), each nonzero, and
+          logarithmic: alpha_i | theta_j(alpha_i) exactly for every line;
+      (2) Q recomputed from the supplied exact lines and, coefficientwise,
+          det M(theta_E, theta_1, theta_2) = c * Q with exact c != 0.
+    Field/normalization provenance is recorded on new certificates
+    ('field': 'QQ'; projective normalization by first nonzero coordinate).
     """
-    lines = [ProjectiveLine(*c) for c in cert['lines']]
+    try:
+        for coords in cert['lines']:
+            if len(coords) != 3 or not all(_is_exact_number(v)
+                                           for v in coords):
+                return False              # floats / malformed line data
+        for key in ('theta1', 'theta2'):
+            if not all(_is_exact_number(v) for v in cert[key]):
+                return False
+        if not _is_exact_number(cert['c']):
+            return False
+        lines = [ProjectiveLine(*c) for c in cert['lines']]
+    except (AssertionError, TypeError, ValueError, KeyError):
+        return False                      # zero line / malformed input
     arr = LineArrangement(lines)
     d1, d2 = cert['d1'], cert['d2']
     n = len(arr)
     if len({l.coords for l in arr.lines}) != n:
-        return False                      # duplicate lines: not reduced
-    if d1 < 0 or d1 + d2 != n - 1:
+        return False    # duplicate/proportional lines: not reduced
+    if not (isinstance(d1, int) and isinstance(d2, int)):
+        return False
+    if d1 < 0 or d1 > d2 or d1 + d2 != n - 1:
         return False                      # degree bookkeeping must match n
+    N1 = len(LineArrangement._monoms(d1))
+    N2 = len(LineArrangement._monoms(d2))
+    if len(cert['theta1']) != 3 * N1 or len(cert['theta2']) != 3 * N2:
+        return False    # wrong stated degree / nonhomogeneous packing
+    if all(sp.nsimplify(t) == 0 for t in cert['theta1']):
+        return False
+    if all(sp.nsimplify(t) == 0 for t in cert['theta2']):
+        return False
     monoms1 = LineArrangement._monoms(d1)
     monoms2 = LineArrangement._monoms(d2)
     th1 = [sp.nsimplify(t) for t in cert['theta1']]
@@ -379,6 +498,9 @@ def certificate_to_json(cert):
         'd1': cert['d1'],
         'd2': cert['d2'],
         'c': str(cert['c']),
+        'field': cert.get('field', 'QQ'),
+        'normalization': cert.get('normalization',
+                                  'projective_first_nonzero_one'),
         'theta1': [str(t) for t in cert['theta1']],
         'theta2': [str(t) for t in cert['theta2']],
         'Q': str(cert['Q']),
@@ -391,6 +513,9 @@ def certificate_from_json(d):
         'd1': int(d['d1']),
         'd2': int(d['d2']),
         'c': sp.nsimplify(d['c']),
+        'field': d.get('field', 'QQ'),
+        'normalization': d.get('normalization',
+                               'projective_first_nonzero_one'),
         'theta1': [sp.nsimplify(t) for t in d['theta1']],
         'theta2': [sp.nsimplify(t) for t in d['theta2']],
         'Q': sp.nsimplify(d['Q']),

@@ -141,7 +141,7 @@ def study_B(out):
             rows.append({"name": name, "n": len(arr), "pair": [d1, d2],
                          "condition": f"perturbed_t=1e-{len(str(t_den))-1}",
                          "label": ("nonfree_exact" if status in
-                                   ("not_free_exact", "modp_reject")
+                                   ("not_target_free", "modp_reject")
                                    else f"unlabeled({status})"),
                          "exact_status": status,
                          "loss": loss, "passes_tau": loss <= TAU})

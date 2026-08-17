@@ -123,12 +123,12 @@ def build_suite():
     #    point-evaluation pair scan)
     p9 = perturb(construct_supersolvable(9, 3), 1, 10**4)
     _, st = find_certificate_fast(p9, target_exponents=(3, 5))
-    assert st in ("not_free_exact", "modp_reject")
+    assert st in ("not_target_free", "modp_reject")
     nonfree_item("perturbed_ss9_t1e-4", p9, 3, 5, "near_free_nonfree_exact",
                  f"exact_point_eval_pair_scan({st})")
     p14 = perturb(construct_supersolvable(14, 6), 1, 10**6)
     _, st14 = find_certificate_fast(p14, target_exponents=(6, 7))
-    assert st14 in ("not_free_exact", "modp_reject")
+    assert st14 in ("not_target_free", "modp_reject")
     nonfree_item("perturbed_ss14_t1e-6", p14, 6, 7,
                  "near_free_nonfree_exact",
                  f"exact_point_eval_pair_scan({st14})")

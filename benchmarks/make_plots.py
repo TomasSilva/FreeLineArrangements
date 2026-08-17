@@ -122,8 +122,8 @@ def plot_perturbation(bench, out):
     ax.set_yscale("log")
     ax.set_xlabel("perturbation size t of one line of a free arrangement")
     ax.set_ylabel("score (floored at 1e-16)")
-    ax.set_title("Degeneration path: new loss decays smoothly ∝ t;\n"
-                 "legacy score jumps chaotically between ~1 and ~0")
+    ax.set_title("Degeneration path: computed loss becomes small along the\n"
+                 "tested path; legacy score jumps between ~1 and ~0")
     ax.legend()
     _save(fig, out, "perturbation.png")
 

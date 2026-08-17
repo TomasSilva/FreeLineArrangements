@@ -124,7 +124,10 @@ def main():
                 "is DISTINCT INTERSECTION LATTICES (WL-hash level). "
                 "`new_vs_corpus` counts lattices absent from the historical "
                 "corpus of the same cell (sound at hash level: isomorphic "
-                "lattices hash equally).\n\n")
+                "lattices hash equally). Units are grouped by beta "
+                "(`beta_groups`); exact discovery sets deduplicate across "
+                "beta values, but yields/rates are never compared or "
+                "aggregated across mixed-beta policies.\n\n")
         f.write("| cell | units | screen evals | certified | distinct "
                 "lattices | non-SS | corpus lattices | new vs corpus | "
                 "best loss | first cert (s) |\n|" + "---|" * 10 + "\n")
