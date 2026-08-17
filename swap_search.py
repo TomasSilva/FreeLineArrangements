@@ -426,14 +426,20 @@ def map_elites(seeds, d1, d2, evaluator, rng, generations=3000,
     Deterministic for a fixed rng seed and seed list (single process, total
     order tie-breaks).  Returns (archive, best_arr, best_loss).
     """
-    from novelty import parse_line_str
+    from novelty import parse_line_str, is_supersolvable_rank3
+    from math import log10
     pk = dict(proposal_kwargs or {})
     n = len(seeds[0])
     archive = {} if archive is None else archive
     best = (None, 1.0)
 
     def elite_sort_key(e):
-        return (not e["certified"], e["loss"], e["height"], e["key"])
+        # certified first; then loss ORDER OF MAGNITUDE; within a magnitude
+        # bucket prefer NON-supersolvable elites (novelty pressure); then
+        # exact loss, height, canonical key (total order, deterministic)
+        bucket = int(log10(max(e["loss"], 1e-16)))
+        return (not e["certified"], bucket, e.get("ss", True), e["loss"],
+                e["height"], e["key"])
 
     def add_to_archive(arr, loss, certified=False):
         nonlocal best
@@ -446,6 +452,7 @@ def map_elites(seeds, d1, d2, evaluator, rng, generations=3000,
             "lattice_hash": lattice_wl_hash(arr),
             "key": canonical_lineset_key(arr),
             "certified": bool(certified),
+            "ss": bool(is_supersolvable_rank3(arr)),
             "descriptor": d,
         }
         cell = archive.setdefault(d, [])

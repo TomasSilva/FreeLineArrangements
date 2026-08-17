@@ -88,6 +88,17 @@ class CampaignIO:
             return
         from novelty import parse_line_str
         arr = LineArrangement([parse_line_str(s) for s in rec["lines"]])
+        # certification-priority screen (n >= 17): the cheap modular-point
+        # test runs BEFORE the exact check; supersolvable candidates are
+        # capped per unit so exact-check time concentrates on the
+        # interesting (non-SS) candidates.  Never affects soundness — SS
+        # candidates beyond the cap are recorded as candidates, not lost.
+        if self.n >= 17 and is_supersolvable_rank3(arr):
+            if self.counters.get("ss_certified", 0) >= 10:
+                self.tried_hashes[h] = "ss_cert_deferred"
+                self.counters["ss_cert_deferred"] = \
+                    self.counters.get("ss_cert_deferred", 0) + 1
+                return
         self.counters["cert_attempts"] += 1
         cert = certify_state(arr, self.d1, self.d2)
         if cert is None:
@@ -107,10 +118,14 @@ class CampaignIO:
         with open(cert_file, "w") as f:
             json.dump(cj, f, indent=1)
         entry = dict(rec)
+        ss_flag = is_supersolvable_rank3(arr)
+        if ss_flag:
+            self.counters["ss_certified"] = \
+                self.counters.get("ss_certified", 0) + 1
         entry.update({
             "certificate_file": os.path.relpath(cert_file, self.out),
             "exponents": [1, self.d1, self.d2],
-            "supersolvable": is_supersolvable_rank3(arr),
+            "supersolvable": ss_flag,
             "wall_s": time.time() - self.t0,
         })
         with open(self.cert_path, "a") as f:
@@ -121,10 +136,39 @@ class CampaignIO:
               flush=True)
 
 
+LIFT_SEEDS_DIR = "swap_lift_seeds"   # repo-root, committed; HPC gets it
+                                     # via git pull
+
+
+def load_lift_seeds(n, d1, d2, repo_root="."):
+    """Certified lifted seeds (non-SS first) written by
+    experiments/lift_nonss.py.  Each seed was exactly certified at lift
+    time; here it is only a START STATE, so no claim rests on it."""
+    import json as _json
+    from novelty import parse_line_str
+    path = os.path.join(repo_root, LIFT_SEEDS_DIR,
+                        f"n{n}_d{d1}_{d2}.json")
+    if not os.path.exists(path):
+        return []
+    out = []
+    for e in _json.load(open(path)).get("seeds", []):
+        try:
+            out.append(LineArrangement([parse_line_str(t)
+                                        for t in e["lines"]]))
+        except Exception:
+            continue
+    return out
+
+
 def build_seeds(n, d1, d2, rng, coord_range, mode="mixed", n_seeds=6,
                 repo_root="."):
     seeds = []
     base = double_pencil_seed(n, d1, d2)
+    # lifted non-SS seeds take priority over the supersolvable basin
+    lifted = load_lift_seeds(n, d1, d2, repo_root)
+    seeds.extend(lifted)
+    for lft in lifted[:2]:
+        seeds.append(perturb_k_swaps(lft, 1, rng, coord_range=coord_range))
     if mode in ("supersolvable", "mixed"):
         seeds.append(base)
     if mode in ("perturbed", "mixed"):
