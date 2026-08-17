@@ -92,6 +92,12 @@ projectively invariant.  The computed value uses a numerical maximizer, so
 a freeness or nonfreeness certificate.  Exact certification is always done
 symbolically (arrangement.LineArrangement.is_free / saito.verify_arrangement).
 
+Regularity caveat: upper semicontinuity is a property of the IDEAL loss S
+(the true supremum over the compact sphere product).  The finite-multistart
+evaluator returns an upper APPROXIMATION S_hat >= S whose value depends on
+initialization and budget; S_hat as a function of the arrangement need not
+inherit any semicontinuity, and no such regularity is claimed for it.
+
 Optimizer
 ---------
 maximize() runs a multistart MM ("IRLS-style") ascent on the product of unit
@@ -145,6 +151,18 @@ DEFAULT_LAMBDA = 1.0
 # valid reported loss (compact attainment can fail at the 0/0 base locus)
 # and is not used anywhere in this module, not even as an initializer.
 DEFAULT_BETA = 0.75
+
+# Functional/implementation version, recorded in diagnostics and manifests.
+# 2.0.0 = 2026-08-16 migration; 2.1.0 = 2026-08 audit (beta 0.75 default,
+# explicit branches); 2.2.0 = production-safety pass (raw-Gamma recording,
+# calibrated clipping, provenance).
+FUNCTIONAL_VERSION = "2.2.0"
+
+# Clip tolerance for Cauchy-Schwarz violations of Gamma <= 1.  Violations
+# up to this size are floating-point roundoff and are clipped (counted and
+# reported); anything larger indicates a genuine numerical problem and
+# raises a warning while being recorded unclipped in gamma_raw.
+GAMMA_CLIP_TOL = 1e-9
 
 # Optimizer effort presets (restarts x MM sweeps).  'rl' is the hot path used
 # inside the reward; 'search' for extension pre-filtering; 'benchmark' for the
@@ -300,6 +318,8 @@ class PenalizedSaitoEvaluator:
         if np.any(norms < 1e-300):
             raise ValueError("zero line")
         self.lines = lines / norms[:, None]
+        self._clip_count = 0
+        self._clip_max_excess = 0.0
 
         self.N1 = len(_monoms(d1))
         self.N2 = len(_monoms(d2))
@@ -492,17 +512,35 @@ class PenalizedSaitoEvaluator:
             penalty = lam * (R ** beta)        # tiny R: underflow-safe power
         den = B_sq + penalty
         if den == 0.0:
-            g = 0.0                            # R = 0 AND B = 0: base locus
+            g_raw = 0.0                        # R = 0 AND B = 0: base locus
+            g = 0.0
         else:
             # includes the R = 0, B != 0 free direction (den = ||B||^2)
-            g = float(num / den)
-            if g > 1.0:
-                # Cauchy-Schwarz gives num <= ||B||^2 <= den exactly; any
-                # excess is floating-point rounding — clip, don't epsilon.
-                g = 1.0
+            g_raw = float(num / den)
+            if g_raw > 1.0:
+                # Cauchy-Schwarz gives num <= ||B||^2 <= den exactly, so any
+                # excess is floating-point rounding.  Clip ONLY roundoff-
+                # sized violations; larger ones signal a numerical bug and
+                # are surfaced, never silently absorbed.
+                excess = g_raw - 1.0
+                self._clip_count += 1
+                if excess > self._clip_max_excess:
+                    self._clip_max_excess = excess
+                if excess <= GAMMA_CLIP_TOL:
+                    g = 1.0
+                else:
+                    import warnings
+                    warnings.warn(
+                        f"Gamma exceeded 1 by {excess:.3e} > GAMMA_CLIP_TOL="
+                        f"{GAMMA_CLIP_TOL:.1e}; leaving unclipped — "
+                        f"investigate conditioning", RuntimeWarning)
+                    g = g_raw
+            else:
+                g = g_raw
         if not return_parts:
             return g
         return g, {
+            "gamma_raw": float(g_raw),
             "B_norm": float(np.sqrt(B_sq)),
             "inner_abs": float(abs(inner)),
             "L1u_norm": float(np.sqrt(r1)),
@@ -772,6 +810,11 @@ class PenalizedSaitoEvaluator:
             "beta_smoothness": ("nonsmooth_at_R0" if beta <= 0.5
                                 else "differentiable"),
             "mm_r_floor": _MM_R_FLOOR,
+            "functional_version": FUNCTIONAL_VERSION,
+            # clipping accounting for THIS evaluator instance (item: verify
+            # clipping is roundoff bookkeeping, not value manufacturing)
+            "gamma_clip_count": self._clip_count,
+            "gamma_clip_max_excess": self._clip_max_excess,
         }
         if not self.iscomplex:
             try:
@@ -954,3 +997,29 @@ def cached_penalized_loss(arr: LineArrangement, d1=None, d2=None,
 
 def clear_cache():
     _LOSS_CACHE.clear()
+
+
+def runtime_provenance(repo_root="."):
+    """Provenance block for manifests/logs: code commit, dirty-tree state,
+    functional version, defaults, field convention."""
+    import subprocess
+    try:
+        rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root,
+                             capture_output=True, text=True,
+                             timeout=10).stdout.strip()
+        dirty = bool(subprocess.run(["git", "status", "--porcelain"],
+                                    cwd=repo_root, capture_output=True,
+                                    text=True, timeout=10).stdout.strip())
+    except Exception:
+        rev, dirty = "unknown", None
+    return {
+        "functional_version": FUNCTIONAL_VERSION,
+        "code_commit": rev,
+        "dirty_tree": dirty,
+        "default_lambda": DEFAULT_LAMBDA,
+        "default_beta": DEFAULT_BETA,
+        "optimization_field_default": "real",
+        "gamma_clip_tol": GAMMA_CLIP_TOL,
+        "mm_r_floor": _MM_R_FLOOR,
+        "profiles": PROFILES,
+    }

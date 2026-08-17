@@ -12,6 +12,25 @@ with theta_1, theta_2 exact rational logarithmic derivations of degrees
 serializes them to JSON, and re-verifies serialized certificates from
 scratch.  The numerical penalized loss (penalized_saito.py) is never part of
 a certificate.
+
+WHY THE NEGATIVE VERDICT IS ALSO EXACT (completeness of the pair search).
+"Not certified" here is a PROOF of non-freeness with the prescribed
+exponents, not a mere search failure.  Let {v_i}, {w_j} be exact bases of
+the degree-(d1, d2) logarithmic kernels.  For u = sum a_i v_i and
+v = sum b_j w_j, every det M(theta_E, u, v) equals c(a, b) * Q by the
+divisibility theorem (deg = n forces proportionality), and c(a, b) =
+a^T C b is BILINEAR with C_ij = c(v_i, w_j).  Hence: if every basis pair
+has c(v_i, w_j) = 0, then C = 0, so EVERY pair of derivations of these
+degrees has determinant identically zero, and no Saito basis with these
+degrees exists — the arrangement is not free with exponents (1, d1, d2).
+Conversely a free arrangement always has some basis pair with c != 0.
+The fast path decides each c(v_i, w_j) exactly by evaluating both sides at
+one exact rational point where Q does not vanish (the identity det = cQ
+holds as polynomials, so a single non-vanishing point determines c).
+`arrangement.is_free` implements the same exhaustive basis-pair criterion
+symbolically; both negatives are exact.  Additionally, if the candidate-
+exponent arithmetic fails (chi(A, t) does not factor with the required
+integer roots), Terao's factorization theorem already excludes freeness.
 """
 
 import numpy as np
@@ -291,12 +310,23 @@ def find_certificate_fast(arr: LineArrangement, target_exponents=None,
 def verify_certificate(cert) -> bool:
     """Re-verify a certificate from scratch, exactly over Q.
 
-    Checks (1) theta_1, theta_2 are logarithmic (alpha_i | theta(alpha_i) for
-    every line), and (2) det M(theta_E, theta_1, theta_2) = c * Q with c != 0.
+    A valid certificate requires ALL of:
+      (0) exactly n pairwise-distinct projective lines with d1 + d2 = n - 1,
+          d1 >= 0;
+      (1) theta_1, theta_2 logarithmic: alpha_i | theta(alpha_i) exactly for
+          every line and both derivations (coefficients in the S_{d1}/S_{d2}
+          monomial bases, so the stated degrees bound the actual degrees);
+      (2) det M(theta_E, theta_1, theta_2) = c * Q exactly, with c != 0
+          (which also forces both derivations to be nonzero).
     """
     lines = [ProjectiveLine(*c) for c in cert['lines']]
     arr = LineArrangement(lines)
     d1, d2 = cert['d1'], cert['d2']
+    n = len(arr)
+    if len({l.coords for l in arr.lines}) != n:
+        return False                      # duplicate lines: not reduced
+    if d1 < 0 or d1 + d2 != n - 1:
+        return False                      # degree bookkeeping must match n
     monoms1 = LineArrangement._monoms(d1)
     monoms2 = LineArrangement._monoms(d2)
     th1 = [sp.nsimplify(t) for t in cert['theta1']]

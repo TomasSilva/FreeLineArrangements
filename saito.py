@@ -1293,10 +1293,12 @@ def extend_arrangement(
     Args:
         seed_arr: known free arrangement to extend.
         coord_range: integer pool range for the new line.
-        loss_threshold: pre-filter threshold (skip exact check if loss above
-            this).  The default was refit on a validation benchmark for the
-            penalized loss (see results_penalized_saito/); lower values are
-            faster but may miss valid extensions.
+        loss_threshold: HEURISTIC pre-filter threshold (skip exact check if
+            loss above this).  The default was refit on a validation
+            benchmark for the penalized loss (see results_penalized_saito/,
+            incl. the n>=14 recall study), but the computed loss is an upper
+            bound from a finite multistart: the threshold trades exact-check
+            work against recall and certifies nothing either way.
         n_restarts: optimizer restarts in the loss pre-filter (default 10).
         verbose: print per-candidate diagnostics.
         target_exponents: optional (d1, d2) override for the loss filter.

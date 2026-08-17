@@ -44,6 +44,14 @@ def main():
         a = m["args"]
         key = (a["n"], a["d1"], a["d2"])
         c = cells[key]
+        # beta provenance: units whose manifests predate the audit patch do
+        # not record beta.  They are labeled unknown and their NUMERICAL
+        # loss statistics are never aggregated with revised (beta-recorded)
+        # units; certified counts and lattice counts are beta-independent
+        # (exact certificates) and aggregate freely.
+        beta_label = str(m.get("beta", "unknown_pre_audit"))
+        c.setdefault("beta_groups", {}).setdefault(beta_label, 0)
+        c["beta_groups"][beta_label] += 1
         c["units"] += 1
         c["restarts"] += m.get("restarts", 0)
         c["screen_evals"] += m.get("evaluator", {}).get("screen_evals", 0)
@@ -80,6 +88,10 @@ def main():
             if cell_name in ref else None
         rows.append({
             "n": n, "d1": d1, "d2": d2, "units": c["units"],
+            "beta_groups": c.get("beta_groups", {}),
+            "pair_class": ("nontrivial" if d1 >= 2 else
+                           "baseline_near_pencil" if d1 == 1
+                           else "baseline_pencil"),
             "restarts": c["restarts"], "screen_evals": c["screen_evals"],
             "cert_attempts": c["cert_attempts"],
             "certified_records": c["certified_records"],
@@ -95,12 +107,15 @@ def main():
 
     with open(os.path.join(args.out, "cell_table.csv"), "w",
               newline="") as f:
+        json_cols = ("engines", "beta_groups")
         w = csv.DictWriter(f, fieldnames=[k for k in rows[0].keys()
-                                          if k != "engines"] + ["engines"])
+                                          if k not in json_cols]
+                           + list(json_cols))
         w.writeheader()
         for r in rows:
             rr = dict(r)
-            rr["engines"] = json.dumps(r["engines"])
+            for k in json_cols:
+                rr[k] = json.dumps(r[k])
             w.writerow(rr)
 
     with open(os.path.join(args.out, "swap_report.md"), "w") as f:

@@ -163,20 +163,38 @@ def main():
     ap.add_argument("--seed-mode", default="mixed")
     ap.add_argument("--out", required=True)
     ap.add_argument("--resume-archive", default=None)
+    ap.add_argument("--allow-baseline", action="store_true",
+                    help="permit baseline classes d1=0 (pencil) and d1=1 "
+                         "(near-pencil); these never count as nontrivial "
+                         "discoveries")
     args = ap.parse_args()
 
     n, d1, d2 = args.n, args.d1, args.d2
-    assert d1 + d2 == n - 1 and 1 <= d1 <= d2
+    assert d1 + d2 == n - 1 and 0 <= d1 <= d2
+    # explicit allowed exponent-pair policy: nontrivial campaigns are d1 >= 2;
+    # d1 = 0 pencils / d1 = 1 near-pencils are baseline classes only and must
+    # be requested explicitly (the library itself remains d1 = 0 capable)
+    pair_class = ("nontrivial" if d1 >= 2 else
+                  "baseline_near_pencil" if d1 == 1 else "baseline_pencil")
+    if pair_class != "nontrivial" and not args.allow_baseline:
+        raise SystemExit(
+            f"cell ({n},{d1},{d2}) is class '{pair_class}': baseline classes "
+            f"require --allow-baseline and are excluded from nontrivial "
+            f"discovery counts")
     os.makedirs(args.out, exist_ok=True)
     rng = np.random.default_rng(args.seed * 100003 + n * 101 + d1)
     deadline = time.time() + args.wall_minutes * 60
 
-    from penalized_saito import DEFAULT_LAMBDA, DEFAULT_BETA
+    from penalized_saito import (DEFAULT_LAMBDA, DEFAULT_BETA,
+                                 runtime_provenance)
     manifest = {
         "args": vars(args), "git_rev": _git_rev("."),
         "start": time.time(), "b2_star": (n - 1) + d1 * d2,
         "lambda": DEFAULT_LAMBDA, "beta": DEFAULT_BETA,
         "optimization_field": "real",
+        "pair_class": pair_class,
+        "allowed_pairs_policy": "nontrivial d1>=2 unless --allow-baseline",
+        "provenance": runtime_provenance("."),
     }
     io = CampaignIO(args.out, n, d1, d2, args.engine, args.seed)
     ev = ChainEvaluator(n, d1, d2, seed=args.seed)
