@@ -38,14 +38,42 @@ from certificates import verify_certificate, certificate_to_json, \
     certificate_from_json
 
 SCHEMA_VERSION = "discovery-2.0"
+SCHEMA_VERSION_K = "discovery-2.1"      # quadratic-field entries
+
+# Coefficient fields the promoter accepts: 'QQ' or a structured quadratic
+# tag with one of these discriminants (matches quadfield support).
+SUPPORTED_FIELD_DISCRIMINANTS = (2, 3, 5, -1, -3)
+
+
+def _entry_field(field_tag):
+    """Validated QuadraticField from an entry/certificate field tag.
+
+    Returns None for 'QQ'.  Raises ValueError for anything unsupported —
+    the field is load-bearing at promotion time, never a pass-through
+    label.
+    """
+    from quadfield import QuadraticField
+    if field_tag in (None, "QQ"):
+        return None
+    K = QuadraticField.from_json(field_tag)   # raises on malformed tags
+    if K.d not in SUPPORTED_FIELD_DISCRIMINANTS:
+        raise ValueError(f"unsupported coefficient field d={K.d}")
+    return K
 
 
 def canonical_discovery_id(arr: LineArrangement) -> str:
-    """Exact canonical identifier: sha256 over the sorted canonical rational
+    """Exact canonical identifier: sha256 over the sorted canonical
     line tuples (ProjectiveLine canonicalizes by the first nonzero
     coordinate, so per-line scaling and line order are quotiented; general
-    GL/PGL images are deliberately NOT identified)."""
-    key = repr(tuple(sorted(str(l.coords) for l in arr.lines)))
+    GL/PGL images are deliberately NOT identified).
+
+    Quadratic-field arrangements prepend the field tag: identical (a, b)
+    coordinate strings under different discriminants are different
+    arrangements and must not collide.
+    """
+    K = arr.coefficient_field()
+    prefix = "" if K is None else f"{K.name}|"
+    key = prefix + repr(tuple(sorted(str(l.coords) for l in arr.lines)))
     return hashlib.sha256(key.encode()).hexdigest()
 
 
@@ -78,10 +106,14 @@ def build_discovery_entry(cert, run_id, engine=None, pair_class=None,
         "lines": [str(l) for l in arr.lines],
         "source": sp_.get("source", "swap_promotion"),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        # schema-2.0 exact-certificate fields
-        "schema_version": SCHEMA_VERSION,
+        # schema-2.0/2.1 exact-certificate fields
+        "schema_version": (SCHEMA_VERSION_K if arr.coefficient_field()
+                           else SCHEMA_VERSION),
         "discovery_id": canonical_discovery_id(arr),
+        # coefficient field of the arrangement/certificate ('QQ' or the
+        # structured quadratic tag); validated against the lines below
         "field": cj.get("field", "QQ"),
+        "coefficient_field": cj.get("field", "QQ"),
         "certificate": cj,
         "certificate_hash": certificate_hash(cj),
         "verification_status": "verified_exact",
@@ -96,6 +128,9 @@ def build_discovery_entry(cert, run_id, engine=None, pair_class=None,
                           else "unknown_pre_audit"),
         "search_beta": (sp_.get("beta") if sp_.get("beta") is not None
                         else "unknown_pre_audit"),
+        # field of the OPTIMIZATION variables (real/complex float), distinct
+        # from the coefficient field above; 'search_field' kept as an alias
+        "optimization_field": sp_.get("field") or "real",
         "search_field": sp_.get("field") or "real",
         "code_commit": prov["code_commit"],
         "source_content_hash": prov["source_content_hash"],
@@ -181,8 +216,17 @@ def load_verified_discoveries(path, reverify=True):
     data = _load_store(path)
     ok, rejects = [], []
     for r in data["arrangements"]:
-        if r.get("schema_version") != SCHEMA_VERSION:
+        sv = r.get("schema_version")
+        if sv not in (SCHEMA_VERSION, SCHEMA_VERSION_K):
             rejects.append((r, "unsupported_schema"))
+            continue
+        try:
+            K = _entry_field(r.get("field", "QQ"))
+        except Exception as ex:
+            rejects.append((r, f"unsupported_field({ex})"))
+            continue
+        if sv == SCHEMA_VERSION_K and K is None:
+            rejects.append((r, "schema_2.1_requires_explicit_field"))
             continue
         if r.get("verification_status") != "verified_exact":
             rejects.append((r, "not_verified_exact"))
@@ -239,7 +283,8 @@ def migrate_legacy_store(path, out_legacy=None, out_quarantine=None,
     verified, legacy, malformed = [], [], []
     for idx, r in enumerate(data["arrangements"]):
         try:
-            if r.get("schema_version") == SCHEMA_VERSION and \
+            if r.get("schema_version") in (SCHEMA_VERSION,
+                                           SCHEMA_VERSION_K) and \
                     r.get("verification_status") == "verified_exact" and \
                     "certificate" in r:
                 if verify_certificate(
@@ -318,8 +363,17 @@ def promote(entries, path, allow_baseline=False, reverify_existing=True):
     rejected, accepted = [], []
     for e in entries:
         did = e.get("discovery_id", "?")
-        if e.get("schema_version") != SCHEMA_VERSION:
+        sv = e.get("schema_version")
+        if sv not in (SCHEMA_VERSION, SCHEMA_VERSION_K):
             rejected.append((did, "wrong_schema"))
+            continue
+        try:
+            K_e = _entry_field(e.get("field", "QQ"))
+        except Exception as ex:
+            rejected.append((did, f"unsupported_field({ex})"))
+            continue
+        if sv == SCHEMA_VERSION_K and K_e is None:
+            rejected.append((did, "schema_2.1_requires_explicit_field"))
             continue
         d1, d2 = e["target_pair"]
         if d1 < 2 and not allow_baseline:
@@ -350,7 +404,8 @@ def promote(entries, path, allow_baseline=False, reverify_existing=True):
                      if r.get("discovery_id")}
         if reverify_existing:
             for r in data["arrangements"]:
-                if r.get("schema_version") == SCHEMA_VERSION and \
+                if r.get("schema_version") in (SCHEMA_VERSION,
+                                               SCHEMA_VERSION_K) and \
                         r.get("verification_status") == "verified_exact":
                     try:
                         ok = verify_certificate(
