@@ -176,8 +176,11 @@ def build_field_seeds(n, d1, d2, rng, coord_range, field_d):
     validates, plus k-swap perturbations of them.  No double-pencil / random
     QQ seeds — the point of a K campaign is the K basin."""
     from known_arrangements import (akn13, validate_akn13_lattice,
-                                    dual_hesse, validate_dual_hesse_lattice)
+                                    dual_hesse, validate_dual_hesse_lattice,
+                                    FIELD_SEED_REGISTRY)
     from sympy import Rational
+    from quadfield import QuadraticField
+    K = QuadraticField(field_d)
     seeds = []
     if field_d == 3 and n == 13:
         for lam in (Rational(2, 3), Rational(1, 5), Rational(3, 7)):
@@ -188,14 +191,25 @@ def build_field_seeds(n, d1, d2, rng, coord_range, field_d):
         H = dual_hesse()
         if validate_dual_hesse_lattice(H):
             seeds.append(H)
+    for factory in FIELD_SEED_REGISTRY.get((field_d, n), []):
+        try:
+            cand = factory()
+            if len(cand) == n and cand not in seeds:
+                seeds.append(cand)
+        except Exception:
+            continue
     lifted = load_lift_seeds(n, d1, d2, ".")
-    seeds.extend(a for a in lifted
-                 if (K := a.coefficient_field()) is not None
-                 and K.d == field_d)
+    for a in lifted:
+        K_a = a.coefficient_field()
+        # field-matched K seeds, and QQ seeds (valid over any K: the
+        # forced-field pools move them into K coordinates)
+        if K_a is None or K_a.d == field_d:
+            seeds.append(a)
     for base_seed in list(seeds)[:3]:
         for k in (1, 2):
             seeds.append(perturb_k_swaps(base_seed, k, rng,
-                                         coord_range=coord_range))
+                                         coord_range=coord_range,
+                                         field=K))
     seen, out = set(), []
     for s in seeds:
         key = canonical_lineset_key(s)
@@ -299,7 +313,10 @@ def main():
     }
     io = CampaignIO(args.out, n, d1, d2, args.engine, args.seed)
     ev = ChainEvaluator(n, d1, d2, seed=args.seed)
+    proposal_field = None
     if args.field_d is not None:
+        from quadfield import QuadraticField
+        proposal_field = QuadraticField(args.field_d)
         seeds = build_field_seeds(n, d1, d2, rng, args.coord_range,
                                   args.field_d)
     else:
@@ -330,7 +347,8 @@ def main():
                 archive, _, bl = map_elites(
                     seeds, d1, d2, ev, rng, generations=2000,
                     on_candidate=io.on_candidate, archive=archive,
-                    on_snapshot=snapshot)
+                    on_snapshot=snapshot,
+                    proposal_kwargs={"field": proposal_field})
                 best_loss_overall = min(best_loss_overall, bl)
                 restarts += 1
         except TimeoutError:
@@ -349,8 +367,10 @@ def main():
             else:
                 budget = {"steps": 1500}
             try:
-                _, bl, _ = engine_fn(seed_arr, d1, d2, ev, rng,
-                                     on_candidate=io.on_candidate, **budget)
+                _, bl, _ = engine_fn(
+                    seed_arr, d1, d2, ev, rng,
+                    on_candidate=io.on_candidate,
+                    proposal_kwargs={"field": proposal_field}, **budget)
                 best_loss_overall = min(best_loss_overall, bl)
             except RuntimeError as e:
                 print(f"  restart {restarts}: {e} — skipping seed",
@@ -360,7 +380,8 @@ def main():
             if restarts % len(seeds) == 0:
                 k = min(2 + restarts // len(seeds), 8)
                 seeds.append(perturb_k_swaps(seeds[0], k, rng,
-                                             coord_range=args.coord_range))
+                                             coord_range=args.coord_range,
+                                             field=proposal_field))
 
     manifest.update({
         "end": time.time(), "restarts": restarts,

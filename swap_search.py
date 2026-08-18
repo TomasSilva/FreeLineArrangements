@@ -40,11 +40,15 @@ from environment import (_singularity_candidates, generate_candidate_lines,
 _K_POOL_CACHE = {}
 
 
-def _integer_pool(arr, coord_range):
+def _integer_pool(arr, coord_range, field=None):
     """QQ: historical integer grid.  Quadratic field: small O_K grid
     (cached per (d, range)); the field-closed singularity pool remains the
-    primary K proposal source."""
-    K = arr.coefficient_field()
+    primary K proposal source.
+
+    `field` (a QuadraticField) FORCES the K grid even when the current
+    state is rational — a declared-field campaign must be able to move a
+    QQ-seeded chain into K coordinates."""
+    K = field if field is not None else arr.coefficient_field()
     if K is None:
         return generate_candidate_lines(coord_range)
     key = (K.d, min(int(coord_range), 1))
@@ -143,11 +147,11 @@ def corpus_seeds(n: int, d1: int, d2: int, limit: int = 20,
 
 
 def perturb_k_swaps(arr: LineArrangement, k: int, rng, coord_range: int = 3,
-                    nontrivial=True, max_tries: int = 200):
+                    nontrivial=True, max_tries: int = 200, field=None):
     """Apply k random valid swaps (uniform L-, random valid L+)."""
     n = len(arr)
     cur = arr.copy()
-    pool = _integer_pool(arr, coord_range)
+    pool = _integer_pool(arr, coord_range, field=field)
     for _ in range(k):
         for _ in range(max_tries):
             i = int(rng.integers(n))
@@ -171,7 +175,8 @@ def perturb_k_swaps(arr: LineArrangement, k: int, rng, coord_range: int = 3,
 def propose_swaps(arr: LineArrangement, d1: int, d2: int, rng,
                   coord_range: int = 3, n_remove: int = 4,
                   n_add_per_remove: int = 24, exact_frac: float = 0.7,
-                  b2_slack: int = 2, tabu=None, nontrivial=True):
+                  b2_slack: int = 2, tabu=None, nontrivial=True,
+                  field=None):
     """Sample candidate swaps (i_minus, L_plus).
 
     For each of `n_remove` random removal choices, build the Δb2-tiers over
@@ -192,7 +197,7 @@ def propose_swaps(arr: LineArrangement, d1: int, d2: int, rng,
         required = b2_star - b2_rest
         # candidate L+ pool: singularity lines (score-sorted) + random pool
         cands = [line for _, line in _singularity_candidates(rest)[:120]]
-        pool = _integer_pool(rest, coord_range)
+        pool = _integer_pool(rest, coord_range, field=field)
         cands.extend(pool[j] for j in rng.choice(len(pool),
                                                  size=min(60, len(pool)),
                                                  replace=False))

@@ -1,0 +1,14 @@
+cell 18 7 10 me 2 -3
+cell 18 7 10 anneal 3 -3
+cascade 18 -3 anneal 3
+cell 15 5 9 me 2 5
+cell 15 5 9 anneal 3 5
+cascade 15 5 anneal 3
+cell 15 5 9 me 2 -1
+cell 15 5 9 anneal 3 -1
+cascade 12 -1 anneal 1
+cascade 13 3 me 2
+cell 13 6 6 me 3 3
+cascade 12 -3 anneal 1
+cell 14 6 7 anneal 1 2
+cell 15 7 7 anneal 1 3

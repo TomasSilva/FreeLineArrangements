@@ -1,0 +1,64 @@
+#!/bin/bash
+#PBS -N swap_K
+#PBS -q par16
+#PBS -l nodes=1:ppn=16
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+# Overnight quadratic-field (Q(sqrt d)) free-arrangement campaign.
+#
+# 14 parallel units per node; unit types:
+#   cell N D1 D2 ENGINE SEED FIELD_D   — one (cell, engine, seed) unit over
+#                                        Q(sqrt FIELD_D) (run_swap_campaign)
+#   cascade START_N FIELD_D ENGINE SEED — climbing unit: search level n,
+#                                        lift certified non-SS to n+1,
+#                                        repeat (run_cascade_campaign)
+# Outputs land under ./results_from_HPC/<jobid>/cells_d<FIELD_D>/...
+#
+# BEFORE FIRST USE on the cluster (once, after git pull):
+#   python -c "import swap_search, quadfield, known_arrangements"   (smoke)
+#
+# Submit:  qsub -v JOBS_FILE=jobs_K_tierA.txt pbs/step7_swap_K.pbs
+#          qsub -v JOBS_FILE=jobs_K_tierB.txt pbs/step7_swap_K.pbs
+
+cd "$PBS_O_WORKDIR"
+module load python/3.8.11-intel-2021.3.0
+source free_arr/bin/activate
+export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+JOBS_FILE=${JOBS_FILE:-jobs_K_tierA.txt}
+WALL_MIN=${WALL_MIN:-1380}   # 23h of the 24h walltime
+OUT_ROOT=${OUT_ROOT:-results_from_HPC/${PBS_JOBID%%.*}}
+mkdir -p "$OUT_ROOT"
+export OUT_ROOT WALL_MIN
+
+echo "== swap_K campaign: $(wc -l < "$JOBS_FILE") units from $JOBS_FILE -> $OUT_ROOT =="
+date
+
+xargs -P 14 -L 1 -a "$JOBS_FILE" bash -c '
+  set -- $0 "$@"
+  mode=$1; shift
+  if [ "$mode" = "cell" ]; then
+    n=$1; d1=$2; d2=$3; eng=$4; seed=$5; fd=$6
+    dir="$OUT_ROOT/cells_d${fd}/n${n}_d${d1}_${d2}"
+    mkdir -p "$dir"
+    python experiments/run_swap_campaign.py \
+        --n "$n" --d1 "$d1" --d2 "$d2" --engine "$eng" --seed "$seed" \
+        --field-d "$fd" --coord-range 1 \
+        --wall-minutes "$WALL_MIN" --out "$dir" \
+        >> "$dir/log_${eng}_s${seed}.txt" 2>&1
+  elif [ "$mode" = "cascade" ]; then
+    sn=$1; fd=$2; eng=$3; seed=$4
+    dir="$OUT_ROOT/cells_d${fd}"
+    mkdir -p "$dir"
+    python experiments/run_cascade_campaign.py \
+        --start-n "$sn" --field-d "$fd" --engine "$eng" --seed "$seed" \
+        --wall-minutes "$WALL_MIN" --out "$dir" \
+        >> "$dir/log_cascade_d${fd}_${eng}_s${seed}.txt" 2>&1
+  else
+    echo "unknown unit mode: $mode" >&2
+  fi
+'
+date
+echo "== done =="

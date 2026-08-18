@@ -218,3 +218,4 @@ legacy_candidates.json
 discoveries.json.backup.*
 legacy_quarantine_report.json
 discoveries_staging.json
+results_from_HPC/
