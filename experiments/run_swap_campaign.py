@@ -87,7 +87,13 @@ class CampaignIO:
                 self.counters["cert_repeat_lattice"] += 1
             return
         from novelty import parse_line_str
-        arr = LineArrangement([parse_line_str(s) for s in rec["lines"]])
+        rec_field = None
+        cf = rec.get("coefficient_field")
+        if cf and cf != "QQ":
+            from quadfield import QuadraticField
+            rec_field = QuadraticField.from_json(cf)
+        arr = LineArrangement([parse_line_str(s, field=rec_field)
+                               for s in rec["lines"]])
         # certification-priority screen (n >= 17): the cheap modular-point
         # test runs BEFORE the exact check; supersolvable candidates are
         # capped per unit so exact-check time concentrates on the

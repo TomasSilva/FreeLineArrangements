@@ -464,8 +464,10 @@ def map_elites(seeds, d1, d2, evaluator, rng, generations=3000,
     def add_to_archive(arr, loss, certified=False):
         nonlocal best
         d = str(descriptor(arr, n))
+        K_arr = arr.coefficient_field()
         rec = {
             "lines": [str(l) for l in arr.lines],
+            "coefficient_field": ("QQ" if K_arr is None else K_arr.to_json()),
             "loss": float(loss), "b2": arr.b2(),
             "m_max": arr.max_multiplicity(),
             "height": coordinate_height(arr),
@@ -500,7 +502,12 @@ def map_elites(seeds, d1, d2, evaluator, rng, generations=3000,
         cells = sorted(archive.keys())
         cell = archive[cells[int(rng.integers(len(cells)))]]
         parent_rec = cell[int(rng.integers(len(cell)))]
-        parent = LineArrangement([parse_line_str(s)
+        parent_field = None
+        cf = parent_rec.get("coefficient_field")
+        if cf and cf != "QQ":
+            from quadfield import QuadraticField
+            parent_field = QuadraticField.from_json(cf)
+        parent = LineArrangement([parse_line_str(s, field=parent_field)
                                   for s in parent_rec["lines"]])
         r = rng.random()
         if r < 0.80:
