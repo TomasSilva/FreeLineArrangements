@@ -83,7 +83,13 @@ def main():
 
     per_cell = {}
     for rec in parents:
-        arr = LineArrangement([parse_line_str(s) for s in rec["lines"]])
+        field = None
+        cf = rec.get("coefficient_field")
+        if cf and cf != "QQ":
+            from quadfield import QuadraticField
+            field = QuadraticField.from_json(cf)
+        arr = LineArrangement([parse_line_str(s, field=field)
+                               for s in rec["lines"]])
         n = len(arr)
         for (d1, d2) in admissible_next_pairs(n):
             t0 = time.time()
@@ -113,6 +119,9 @@ def main():
                     "parent_n": n,
                     "lift_line": str(s["new_line"]),
                     "certificate": certificate_to_json(cert),
+                    "coefficient_field": ("QQ" if lifted.coefficient_field()
+                                          is None else
+                                          lifted.coefficient_field().to_json()),
                     "provenance": "lift_nonss_v1",
                 }
                 per_cell.setdefault((n + 1, d1, d2), []).append(entry)

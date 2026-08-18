@@ -153,10 +153,53 @@ def load_lift_seeds(n, d1, d2, repo_root="."):
     out = []
     for e in _json.load(open(path)).get("seeds", []):
         try:
-            out.append(LineArrangement([parse_line_str(t)
+            field = None
+            cf = e.get("coefficient_field")
+            if cf and cf != "QQ":
+                from quadfield import QuadraticField
+                field = QuadraticField.from_json(cf)
+            out.append(LineArrangement([parse_line_str(t, field=field)
                                         for t in e["lines"]]))
         except Exception:
             continue
+    return out
+
+
+def build_field_seeds(n, d1, d2, rng, coord_range, field_d):
+    """Seeds for a quadratic-field campaign: known K fixtures whose lattice
+    validates, plus k-swap perturbations of them.  No double-pencil / random
+    QQ seeds — the point of a K campaign is the K basin."""
+    from known_arrangements import (akn13, validate_akn13_lattice,
+                                    dual_hesse, validate_dual_hesse_lattice)
+    from sympy import Rational
+    seeds = []
+    if field_d == 3 and n == 13:
+        for lam in (Rational(2, 3), Rational(1, 5), Rational(3, 7)):
+            cand = akn13(lam)
+            if validate_akn13_lattice(cand):
+                seeds.append(cand)
+    if field_d == -3 and n == 9:
+        H = dual_hesse()
+        if validate_dual_hesse_lattice(H):
+            seeds.append(H)
+    lifted = load_lift_seeds(n, d1, d2, ".")
+    seeds.extend(a for a in lifted
+                 if (K := a.coefficient_field()) is not None
+                 and K.d == field_d)
+    for base_seed in list(seeds)[:3]:
+        for k in (1, 2):
+            seeds.append(perturb_k_swaps(base_seed, k, rng,
+                                         coord_range=coord_range))
+    seen, out = set(), []
+    for s in seeds:
+        key = canonical_lineset_key(s)
+        if key not in seen and is_valid_state(s, n, nontrivial=(d1 >= 2)):
+            seen.add(key)
+            out.append(s)
+    if not out:
+        raise SystemExit(
+            f"no K seeds available for cell ({n},{d1},{d2}) over d={field_d}"
+            " — lift seeds or known fixtures required")
     return out
 
 
@@ -207,6 +250,11 @@ def main():
     ap.add_argument("--seed-mode", default="mixed")
     ap.add_argument("--out", required=True)
     ap.add_argument("--resume-archive", default=None)
+    ap.add_argument("--field-d", type=int, default=None,
+                    choices=[2, 3, 5, -1, -3],
+                    help="run the campaign over Q(sqrt(d)): K seeds "
+                         "(known fixtures + lifted K seeds) and field-"
+                         "closed proposals; omit for the QQ campaign")
     ap.add_argument("--allow-baseline", action="store_true",
                     help="permit baseline classes d1=0 (pencil) and d1=1 "
                          "(near-pencil); these never count as nontrivial "
@@ -235,15 +283,22 @@ def main():
         "args": vars(args), "git_rev": _git_rev("."),
         "start": time.time(), "b2_star": (n - 1) + d1 * d2,
         "lambda": DEFAULT_LAMBDA, "beta": DEFAULT_BETA,
-        "optimization_field": "real",
+        "optimization_field": ("complex" if (args.field_d or 0) < 0
+                               else "real"),
+        "coefficient_field": ("QQ" if args.field_d is None else
+                              {"type": "quadratic", "d": args.field_d}),
         "pair_class": pair_class,
         "allowed_pairs_policy": "nontrivial d1>=2 unless --allow-baseline",
         "provenance": runtime_provenance("."),
     }
     io = CampaignIO(args.out, n, d1, d2, args.engine, args.seed)
     ev = ChainEvaluator(n, d1, d2, seed=args.seed)
-    seeds = build_seeds(n, d1, d2, rng, args.coord_range,
-                        mode=args.seed_mode)
+    if args.field_d is not None:
+        seeds = build_field_seeds(n, d1, d2, rng, args.coord_range,
+                                  args.field_d)
+    else:
+        seeds = build_seeds(n, d1, d2, rng, args.coord_range,
+                            mode=args.seed_mode)
     print(f"cell ({n},{d1},{d2}) engine={args.engine} seed={args.seed}: "
           f"{len(seeds)} seeds, wall={args.wall_minutes:.0f}min", flush=True)
 

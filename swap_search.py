@@ -34,7 +34,23 @@ import numpy as np
 from sympy import Rational
 
 from arrangement import LineArrangement, ProjectiveLine
-from environment import _singularity_candidates, generate_candidate_lines
+from environment import (_singularity_candidates, generate_candidate_lines,
+                         generate_candidate_lines_K)
+
+_K_POOL_CACHE = {}
+
+
+def _integer_pool(arr, coord_range):
+    """QQ: historical integer grid.  Quadratic field: small O_K grid
+    (cached per (d, range)); the field-closed singularity pool remains the
+    primary K proposal source."""
+    K = arr.coefficient_field()
+    if K is None:
+        return generate_candidate_lines(coord_range)
+    key = (K.d, min(int(coord_range), 1))
+    if key not in _K_POOL_CACHE:
+        _K_POOL_CACHE[key] = generate_candidate_lines_K(K, key[1])
+    return _K_POOL_CACHE[key]
 from penalized_saito import PenalizedSaitoEvaluator, cached_penalized_loss
 from saito import construct_supersolvable, predicted_delta_b2
 from novelty import (lattice_wl_hash, is_essential, coordinate_height,
@@ -131,7 +147,7 @@ def perturb_k_swaps(arr: LineArrangement, k: int, rng, coord_range: int = 3,
     """Apply k random valid swaps (uniform L-, random valid L+)."""
     n = len(arr)
     cur = arr.copy()
-    pool = generate_candidate_lines(coord_range)
+    pool = _integer_pool(arr, coord_range)
     for _ in range(k):
         for _ in range(max_tries):
             i = int(rng.integers(n))
@@ -176,7 +192,7 @@ def propose_swaps(arr: LineArrangement, d1: int, d2: int, rng,
         required = b2_star - b2_rest
         # candidate L+ pool: singularity lines (score-sorted) + random pool
         cands = [line for _, line in _singularity_candidates(rest)[:120]]
-        pool = generate_candidate_lines(coord_range)
+        pool = _integer_pool(rest, coord_range)
         cands.extend(pool[j] for j in rng.choice(len(pool),
                                                  size=min(60, len(pool)),
                                                  replace=False))
@@ -319,7 +335,11 @@ def _record(arr, d1, d2, loss, engine, step, extra=None):
         "lattice_hash": lattice_wl_hash(arr),
         "engine": engine, "step": int(step), "t": time.time(),
         "lambda": DEFAULT_LAMBDA, "beta": DEFAULT_BETA,
-        "optimization_field": "real",
+        "optimization_field": ("complex" if (arr.coefficient_field()
+                               and not arr.coefficient_field().is_real)
+                               else "real"),
+        "coefficient_field": ("QQ" if arr.coefficient_field() is None
+                              else arr.coefficient_field().to_json()),
     }
     if extra:
         rec.update(extra)

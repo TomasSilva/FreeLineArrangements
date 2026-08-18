@@ -1264,7 +1264,9 @@ def _enumerate_extension_candidates(arr, coord_range=5, include_singularity=True
     # Each such line has form: through point P with direction D = (dx, dy, dz)
     # Parametrize: line normal = P × D (cross product). The new line passes
     # through P (an existing multiple point) and has small-integer normal coords.
-    if max_denominator > 1:
+    if max_denominator > 1 and arr.coefficient_field() is None:
+        # float-snap rationalization is a QQ-only heuristic; over K the
+        # exact singularity pool + O_K grid are the proposal sources
         from arrangement import ProjectiveLine as PL
         pts = arr._structure() if len(arr) >= 2 else {}
         # Use only multiple points (multiplicity >= 2)
@@ -1368,9 +1370,19 @@ def extend_arrangement(
             continue
         n_passed_filter += 1
 
-        # Exact verification
+        # Exact verification (quadratic fields use the fast certificate
+        # path: same exact guarantees, plus the mod-p block prescreen)
         try:
-            is_free, exps = new_arr.is_free()
+            if new_arr.coefficient_field() is not None:
+                from certificates import (find_certificate_fast,
+                                          verify_certificate)
+                cert, _status = find_certificate_fast(
+                    new_arr, target_exponents=target_exponents)
+                if cert is None or not verify_certificate(cert):
+                    continue
+                is_free, exps = True, (1,) + tuple(target_exponents)
+            else:
+                is_free, exps = new_arr.is_free()
         except Exception:
             continue
         if not is_free:

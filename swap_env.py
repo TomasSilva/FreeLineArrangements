@@ -142,6 +142,11 @@ class SwapArrangementEnv:
         if target_exponents is not None:
             self.d1, self.d2 = target_exponents
         base = double_pencil_seed(self.target_n, self.d1, self.d2)
+        if base.coefficient_field() is not None:
+            raise NotImplementedError(
+                "the RL arm is QQ-only: float32 observations cannot carry "
+                "quadratic-field coordinates; use the greedy/anneal/"
+                "MAP-Elites engines (--field-d) for K campaigns")
         if self.seed_mode == "perturbed":
             self.arr = perturb_k_swaps(base, self.k_perturb, self.rng,
                                        coord_range=self.coord_range)

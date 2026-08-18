@@ -63,6 +63,35 @@ def generate_candidate_lines(coord_range=3):
     return candidates
 
 
+def generate_candidate_lines_K(field, coord_range=1):
+    """Projectively distinct lines with O_K-grid coefficients a + b*sqrt(d),
+    a, b integers in [-coord_range, coord_range] (small by design: the grid
+    grows as r^6; the field-closed singularity pool is the primary K
+    proposal source).  Includes the rational sub-grid."""
+    from quadfield import QuadraticField
+    if not hasattr(field, "d"):
+        field = QuadraticField(field)
+    vals = []
+    r = coord_range
+    for a in range(-r, r + 1):
+        for b in range(-r, r + 1):
+            vals.append(field.element(a, b))
+    candidates, seen = [], set()
+    for va in vals:
+        for vb in vals:
+            for vc in vals:
+                if va == 0 and vb == 0 and vc == 0:
+                    continue
+                try:
+                    line = ProjectiveLine(va, vb, vc)
+                except AssertionError:
+                    continue
+                if line.coords not in seen:
+                    seen.add(line.coords)
+                    candidates.append(line)
+    return candidates
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Singularity-driven candidate generation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,7 +119,14 @@ def _singularity_candidates(arr):
     P = len(pt_list)
     if P < 2:
         return []
-    pts_float = np.array([[float(c) for c in pt] for pt in pt_list], dtype=np.float64)
+    K = arr.coefficient_field()
+    if K is not None and not K.is_real:
+        def _emb(vals):
+            return np.array([complex(v) for v in vals], dtype=np.complex128)
+    else:
+        def _emb(vals):
+            return np.array([float(v) for v in vals], dtype=np.float64)
+    pts_float = np.array([_emb(pt) for pt in pt_list])
     mults_arr = np.array(mults_list, dtype=np.float64)
 
     # Generate candidate lines from pairs (exact arithmetic for dedup)
@@ -100,15 +136,15 @@ def _singularity_candidates(arr):
             line = ProjectiveLine.from_two_points(pt_list[i], pt_list[j])
             if line is None or line.coords in existing or line.coords in candidates:
                 continue
-            candidates[line.coords] = (line, line.to_float())
+            candidates[line.coords] = (line, _emb(line.coords))
 
     if not candidates:
         return []
 
     # Batch score all candidates at once: dot product with all points
     cand_list = list(candidates.values())
-    cand_float = np.array([cf for _, cf in cand_list], dtype=np.float64)  # (C, 3)
-    dots = cand_float @ pts_float.T  # (C, P)
+    cand_float = np.array([cf for _, cf in cand_list])  # (C, 3)
+    dots = cand_float @ pts_float.T  # (C, P); complex modulus for complex K
     on_line = np.abs(dots) < 1e-10  # boolean (C, P)
     scores = on_line @ mults_arr  # (C,) — sum of mults for points on each line
 
