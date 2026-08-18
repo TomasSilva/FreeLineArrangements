@@ -113,6 +113,7 @@ def main():
 
     n = args.start_n
     seeds = None      # level seeds; None -> build_field_seeds
+    last_seeds = []   # previous level's working seeds (fallback)
     while time.time() < deadline and n <= args.max_n:
         pairs = balanced_pairs(n)
         d1, d2 = pairs[(args.seed + len(manifest["levels"])) % max(
@@ -126,8 +127,16 @@ def main():
                 seeds = build_field_seeds(n, d1, d2, rng, args.coord_range,
                                           args.field_d)
             except SystemExit as e:
-                print(f"[{run_tag}] level {n}: {e}", flush=True)
-                break
+                if last_seeds:
+                    # no registry fixture at this level: keep climbing from
+                    # the previous level's seed set (perturbed for variety)
+                    seeds = list(last_seeds)
+                    seeds.append(perturb_k_swaps(seeds[0], 2, rng,
+                                                 coord_range=args.coord_range,
+                                                 field=K))
+                else:
+                    print(f"[{run_tag}] level {n}: {e}", flush=True)
+                    break
         io = CampaignIO(cell_dir, n, d1, d2, f"cascade-{args.engine}",
                         args.seed)
         ev = ChainEvaluator(n, d1, d2, seed=args.seed)
@@ -136,6 +145,7 @@ def main():
               f"{len(seeds)} seeds, slice "
               f"{(slice_end - time.time())/60:.0f}min", flush=True)
 
+        last_seeds = list(seeds)
         restarts = 0
         pk = {"field": K, "coord_range": args.coord_range}
         while time.time() < slice_end:
@@ -215,8 +225,12 @@ def main():
                 n += 1
                 seeds = next_seeds
                 continue
-        # no lifts: keep mining this level with refreshed seeds
-        seeds = None
+        # no lifts: KEEP the current seeds (never drop to None mid-level —
+        # a level without a registry fixture would kill the unit) and add an
+        # escalating perturbation so repeated slices diversify
+        seeds.append(perturb_k_swaps(
+            seeds[0], min(2 + len(manifest["levels"]) % 5, 6), rng,
+            coord_range=args.coord_range, field=K))
 
     print(f"[{run_tag}] DONE at level {n}, "
           f"{len(manifest['levels'])} level-slices", flush=True)
