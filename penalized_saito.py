@@ -167,7 +167,9 @@ DEFAULT_BETA = 0.75
 # 2.0.0 = 2026-08-16 migration; 2.1.0 = 2026-08 audit (beta 0.75 default,
 # explicit branches); 2.2.0 = production-safety pass (raw-Gamma recording,
 # calibrated clipping, provenance).
-FUNCTIONAL_VERSION = "2.4.0"
+FUNCTIONAL_VERSION = "2.5.0"   # 2.5.0: field-aware cache identity +
+                               # quadratic-field embeddings; QQ loss values
+                               # unchanged (regression-locked by goldens)
 
 # Numerical-status values for Gamma evaluations (production-safety pass).
 GAMMA_OK = "OK"
@@ -310,9 +312,22 @@ def _line_kernel_basis(a):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _lines_matrix(arr_or_lines, dtype):
-    """Extract an (n, 3) coefficient matrix from a LineArrangement or array."""
+    """Extract an (n, 3) coefficient matrix from a LineArrangement or array.
+
+    Quadratic-field arrangements embed through the field's principal
+    embedding; a complex field requires a complex dtype (raise, never
+    silently truncate the imaginary part).
+    """
     if isinstance(arr_or_lines, LineArrangement):
-        rows = [line.to_float() for line in arr_or_lines.lines]
+        K = arr_or_lines.coefficient_field()
+        if K is not None and not K.is_real:
+            if not np.issubdtype(np.dtype(dtype), np.complexfloating):
+                raise ValueError(
+                    f"arrangement over {K.name} needs a complex dtype "
+                    f"(got {np.dtype(dtype)}); pass dtype=np.complex128")
+            rows = [line.embed() for line in arr_or_lines.lines]
+        else:
+            rows = [line.to_float() for line in arr_or_lines.lines]
         return np.array(rows, dtype=dtype)
     m = np.asarray(arr_or_lines, dtype=dtype)
     if m.ndim != 2 or m.shape[1] != 3:
@@ -353,6 +368,20 @@ class PenalizedSaitoEvaluator:
             raise ValueError("zero line")
         self._raw_lines = lines.copy()   # pre-normalization inputs (for the
                                          # arbitrary-precision rebuild path)
+        # Exact coordinate data for the Stage-C rebuild: (a, b) Rational
+        # pairs per coordinate with value a + b*sqrt(field_d).  For QQ and
+        # raw-array inputs this stays None and Stage C rebuilds from
+        # _raw_lines exactly as before.
+        self._exact_lines = None
+        self._field_d = None
+        if isinstance(arr_or_lines, LineArrangement):
+            K = arr_or_lines.coefficient_field()
+            if K is not None:
+                from quadfield import split_parts
+                self._field_d = K.d
+                self._exact_lines = [
+                    [split_parts(v) for v in line.coords]
+                    for line in arr_or_lines.lines]
         self.lines = lines / norms[:, None]
         self._clip_count = 0
         self._clip_max_excess = 0.0
@@ -591,13 +620,31 @@ class PenalizedSaitoEvaluator:
             def conj(x):
                 return mp.conj(x) if self.iscomplex else x
 
-            raw = self._raw_lines
             n = self.n
             lines = []
-            for i in range(n):
-                a = [C(raw[i, k]) for k in range(3)]
-                nrm = mp.sqrt(sum(mp.fabs(t) ** 2 for t in a))
-                lines.append([t / nrm for t in a])
+            if self._exact_lines is not None:
+                # rebuild from EXACT field data: a + b*sqrt(d) at dps digits
+                # under the principal embedding (never from float64 copies)
+                d_f = self._field_d
+                sqrt_d = (mp.sqrt(mp.mpf(d_f)) if d_f > 0
+                          else mp.mpc(0, 1) * mp.sqrt(mp.mpf(-d_f)))
+                for row in self._exact_lines:
+                    a = []
+                    for (pa, pb) in row:
+                        # already mp-typed at dps: never round-trip through
+                        # Python float/complex (would truncate to 53 bits)
+                        val = (mp.mpf(int(pa.p)) / mp.mpf(int(pa.q))
+                               + (mp.mpf(int(pb.p)) / mp.mpf(int(pb.q)))
+                               * sqrt_d)
+                        a.append(val)
+                    nrm = mp.sqrt(sum(mp.fabs(t) ** 2 for t in a))
+                    lines.append([t / nrm for t in a])
+            else:
+                raw = self._raw_lines
+                for i in range(n):
+                    a = [C(raw[i, k]) for k in range(3)]
+                    nrm = mp.sqrt(sum(mp.fabs(t) ** 2 for t in a))
+                    lines.append([t / nrm for t in a])
 
             d1, d2 = self.d1, self.d2
             m1, m2 = _monoms(d1), _monoms(d2)
@@ -1180,7 +1227,7 @@ def admissible_degree_pairs(n, include_zero=True):
 def penalized_saito_loss(arr_or_lines, d1=None, d2=None,
                          lam=DEFAULT_LAMBDA, beta=DEFAULT_BETA,
                          profile="search", n_restarts=None, n_iters=None,
-                         seed=0, warm_starts=None, dtype=np.float64,
+                         seed=0, warm_starts=None, dtype=None,
                          return_details=False):
     """Penalized Saito loss S_{lam, beta}(A; d1, d2) (numerical upper bound).
 
@@ -1189,10 +1236,20 @@ def penalized_saito_loss(arr_or_lines, d1=None, d2=None,
     returned.  Candidate-exponent arithmetic is a convenience default here; it
     never gates the definition — pass any (d1, d2) with d1 + d2 = n - 1.
 
+    dtype=None auto-selects: float64, upgraded to complex128 for
+    arrangements over a complex quadratic field.  Explicitly passing a real
+    dtype for a complex-field arrangement raises.
+
     Boundary convention: for n < 3 this wrapper returns 1.0 (the search
     pipeline treats such stubs as maximally unfinished).  The evaluator
     itself handles n < 3 degree pairs correctly if constructed directly.
     """
+    if dtype is None:
+        dtype = np.float64
+        if isinstance(arr_or_lines, LineArrangement):
+            K = arr_or_lines.coefficient_field()
+            if K is not None and not K.is_real:
+                dtype = np.complex128
     lines = _lines_matrix(arr_or_lines, dtype)
     n = lines.shape[0]
     if n < 3:
@@ -1213,7 +1270,9 @@ def penalized_saito_loss(arr_or_lines, d1=None, d2=None,
                 dtype=dtype, return_details=return_details)
         d1, d2 = exps
 
-    ev = PenalizedSaitoEvaluator(lines, d1, d2, dtype=dtype)
+    # Pass the original input (not the converted array): a LineArrangement
+    # carries its exact coordinates into the evaluator's Stage-C rebuild.
+    ev = PenalizedSaitoEvaluator(arr_or_lines, d1, d2, dtype=dtype)
     res = ev.maximize(lam=lam, beta=beta, n_restarts=n_restarts,
                       n_iters=n_iters, seed=seed, warm_starts=warm_starts)
     if res.get("status") == "numerical_error":
@@ -1228,9 +1287,15 @@ def penalized_saito_loss(arr_or_lines, d1=None, d2=None,
 def penalized_saito_loss_all_pairs(arr_or_lines, lam=DEFAULT_LAMBDA,
                                    beta=DEFAULT_BETA, profile="search",
                                    n_restarts=None, n_iters=None, seed=0,
-                                   include_zero=True, dtype=np.float64,
+                                   include_zero=True, dtype=None,
                                    return_details=False):
     """Exponent-independent envelope: min over all (d1, d2), d1 + d2 = n - 1."""
+    if dtype is None:
+        dtype = np.float64
+        if isinstance(arr_or_lines, LineArrangement):
+            K = arr_or_lines.coefficient_field()
+            if K is not None and not K.is_real:
+                dtype = np.complex128
     lines = _lines_matrix(arr_or_lines, dtype)
     n = lines.shape[0]
     if n < 3:
@@ -1284,7 +1349,20 @@ def _identity_hash():
 
 
 def _canonical_key(arr: LineArrangement):
+    if arr.coefficient_field() is not None:
+        # QuadElem has no numeric order; canonical repr strings sort stably
+        return tuple(sorted(str(line.coords) for line in arr.lines))
     return tuple(sorted(line.coords for line in arr.lines))
+
+
+def _field_dtype_tags(arr: LineArrangement):
+    """(field_tag, dtype_str, dtype) for the cache key and evaluator."""
+    K = arr.coefficient_field()
+    if K is None:
+        return "QQ", "float64", np.float64
+    if K.is_real:
+        return K.name, "float64", np.float64
+    return K.name, "complex128", np.complex128
 
 
 def cached_penalized_loss(arr: LineArrangement, d1=None, d2=None,
@@ -1310,9 +1388,10 @@ def cached_penalized_loss(arr: LineArrangement, d1=None, d2=None,
     # independent caches); bitwise repeatability is claimed only within the
     # environment recorded by runtime_provenance().
     prof = PROFILES[profile]
+    field_tag, dtype_str, _ = _field_dtype_tags(arr)
     key = (_canonical_key(arr), d1, d2, float(lam), float(beta), profile,
            prof["n_restarts"], prof["n_iters"], seed,
-           "real", "float64", _MM_R_FLOOR, FUNCTIONAL_VERSION,
+           field_tag, dtype_str, _MM_R_FLOOR, FUNCTIONAL_VERSION,
            "BW_orthonormal_monomial_v1", _identity_hash())
     with _CACHE_LOCK:
         hit = _LOSS_CACHE.get(key)
@@ -1382,6 +1461,11 @@ def runtime_provenance(repo_root="."):
         "default_lambda": DEFAULT_LAMBDA,
         "default_beta": DEFAULT_BETA,
         "optimization_field_default": "real",
+        "coefficient_field_support": "QQ and quadratic Q(sqrt d), "
+                                     "d in {2, 3, 5, -1, -3}; complex "
+                                     "fields evaluate in complex128 under "
+                                     "the principal embedding",
+        "cache_key_field_aware": True,
         "gamma_tolerance_model": "64*max(64, N_out+dim_u+dim_v)*eps(dtype)",
         "mm_r_floor": _MM_R_FLOOR,
         "profiles": PROFILES,
