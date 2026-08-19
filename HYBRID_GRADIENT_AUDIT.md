@@ -107,12 +107,21 @@ Gradient validation (tests/test_hybrid_refine.py, 10 tests):
 equal budget of 180 production Saito evaluations per run (refinement's
 exact re-scoring evaluations are charged against the same budget; wall
 clock reported separately), identical seeds and initial states, per-run
-cache clearing.  Plus the n=14 recovery test on a verified lift-seed
-discovery with one line perturbed.  Metrics, candidates (with the
-four-level novelty labels; every certificate independently re-verified),
-failures, manifest with commit + source-content hash, and plots live in
-that directory.  RESULTS: see `metrics.json` / `RESULTS.md` there (filled
-by the run; summarized in the final response of the session).
+cache clearing.  Metrics, candidates (with the four-level novelty labels;
+every certificate independently re-verified), failures, manifest with
+commit + source-content hash, and plots live in that directory.
+
+**RESULTS (`RESULTS.md` there): the arms TIE at equal budgets** — the
+discrete engine saturates all three smoke cells (31 certificates per arm,
+identical best losses and unique lattices; refine wall +9%).  Mechanism
+health perfect: 6/18 refinements exact-accepted, 0 numerical failures,
+0 collisions, 0 Gamma > 1.  The n=6 braid recovery certifies; the n=14
+recovery is VACUOUS (single-line perturbations of the lift seed keep the
+loss at 1e-12..1e-9 — a moduli-rich free family), itself a documented
+finding.  Acceptance criterion 4 (equal-budget improvement) NOT met on
+this smoke; the plausible payoff setting — late-stage polish in hard
+cells where the discrete engine stalls at small nonzero losses — is
+proposed as the follow-up experiment.
 
 ## Limitations (mathematical and numerical)
 
