@@ -91,7 +91,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--wall-minutes", type=float, default=1380.0)
     ap.add_argument("--slice-minutes", type=float, default=90.0)
-    ap.add_argument("--max-n", type=int, default=20)
+    ap.add_argument("--max-n", type=int, default=24)
     ap.add_argument("--max-parents-per-level", type=int, default=3)
     ap.add_argument("--coord-range", type=int, default=1)
     ap.add_argument("--out", required=True)

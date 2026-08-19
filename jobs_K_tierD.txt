@@ -1,0 +1,14 @@
+cascade 20 3 anneal 8
+cascade 18 -3 me 6
+cell 21 10 10 me 0 qq
+cell 21 9 11 me 0 qq
+cell 20 8 11 me 0 qq
+cell 20 9 10 me 2 qq
+cell 19 9 9 me 0 qq
+cell 18 7 10 me 3 -3
+cell 18 8 9 anneal 3 qq
+cell 17 8 8 me 0 qq
+cell 17 7 9 anneal 2 qq
+cell 16 7 8 me 4 qq
+cell 15 7 7 me 4 -3
+cell 14 6 7 me 4 -1
