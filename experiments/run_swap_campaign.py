@@ -275,6 +275,16 @@ def main():
                     help="run the campaign over Q(sqrt(d)): K seeds "
                          "(known fixtures + lifted K seeds) and field-"
                          "closed proposals; omit for the QQ campaign")
+    ap.add_argument("--max-mult", type=int, default=None,
+                    help="HARD maximal-multiplicity ceiling (epsilon-"
+                         "directed hunts: high d1-m_max); states above it "
+                         "are invalid, and the energy gains a small "
+                         "m-target pull (logged separately)")
+    ap.add_argument("--surrogate", default=None,
+                    help="path to a surrogate checkpoint (.pt): proposals "
+                         "are generated WIDE and the learned ranker selects "
+                         "which receive true evaluations; scores never "
+                         "touch losses, acceptance or certification")
     ap.add_argument("--allow-baseline", action="store_true",
                     help="permit baseline classes d1=0 (pencil) and d1=1 "
                          "(near-pencil); these never count as nontrivial "
@@ -308,11 +318,21 @@ def main():
         "coefficient_field": ("QQ" if args.field_d is None else
                               {"type": "quadratic", "d": args.field_d}),
         "pair_class": pair_class,
+        "max_mult": args.max_mult,
+        "proposal_ranker": (args.surrogate or None),
         "allowed_pairs_policy": "nontrivial d1>=2 unless --allow-baseline",
         "provenance": runtime_provenance("."),
     }
     io = CampaignIO(args.out, n, d1, d2, args.engine, args.seed)
-    ev = ChainEvaluator(n, d1, d2, seed=args.seed)
+    ev = ChainEvaluator(n, d1, d2, seed=args.seed,
+                        m_target=args.max_mult)
+    ranker = None
+    if args.surrogate:
+        from surrogate import SurrogateRanker
+        ranker = SurrogateRanker.load(args.surrogate)
+        print(f"surrogate ranker loaded: {args.surrogate} "
+              f"(holdout metrics {ranker.provenance.get('holdout_metrics')})",
+              flush=True)
     proposal_field = None
     if args.field_d is not None:
         from quadfield import QuadraticField
@@ -348,7 +368,9 @@ def main():
                     seeds, d1, d2, ev, rng, generations=2000,
                     on_candidate=io.on_candidate, archive=archive,
                     on_snapshot=snapshot,
-                    proposal_kwargs={"field": proposal_field})
+                    proposal_kwargs={"field": proposal_field,
+                                     "ranker": ranker,
+                                     "max_mult": args.max_mult})
                 best_loss_overall = min(best_loss_overall, bl)
                 restarts += 1
         except TimeoutError:
@@ -370,7 +392,9 @@ def main():
                 _, bl, _ = engine_fn(
                     seed_arr, d1, d2, ev, rng,
                     on_candidate=io.on_candidate,
-                    proposal_kwargs={"field": proposal_field}, **budget)
+                    proposal_kwargs={"field": proposal_field,
+                                     "ranker": ranker,
+                                     "max_mult": args.max_mult}, **budget)
                 best_loss_overall = min(best_loss_overall, bl)
             except RuntimeError as e:
                 print(f"  restart {restarts}: {e} — skipping seed",

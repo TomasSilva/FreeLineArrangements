@@ -77,9 +77,12 @@ LOSS_CANDIDATE_THRESHOLD = 1e-6     # matches the refit extension pre-filter
 # Validity
 # ─────────────────────────────────────────────────────────────────────────────
 
-def is_valid_state(arr: LineArrangement, n: int, nontrivial: bool = True):
+def is_valid_state(arr: LineArrangement, n: int, nontrivial: bool = True,
+                   max_mult=None):
     """Exactly n distinct lines, essential; in nontrivial cells additionally
-    m_max <= n - 2 (no pencil / near-pencil)."""
+    m_max <= n - 2 (no pencil / near-pencil).  `max_mult` adds an optional
+    HARD multiplicity ceiling (the epsilon-directed hunts: high d1 - m_max
+    needs low m_max; an invalid state is rejected, never penalized)."""
     if len(arr) != n:
         return False
     if len({l.coords for l in arr.lines}) != n:
@@ -88,7 +91,18 @@ def is_valid_state(arr: LineArrangement, n: int, nontrivial: bool = True):
         return False
     if nontrivial and arr.max_multiplicity() > n - 2:
         return False
+    if max_mult is not None and arr.max_multiplicity() > max_mult:
+        return False
     return True
+
+
+def min_feasible_m(n: int, d1: int) -> int:
+    """Smallest maximal multiplicity a FREE arrangement of n lines with
+    minimal exponent d1 >= m can have: Dimca-Kuhne-Pokora Prop 3.1 gives
+    n <= m(m + 2 + eps)/2 with eps = d1 - m, i.e. m >= 2n/(d1 + 2).
+    Values below this ceiling are provably impossible targets."""
+    import math
+    return max(2, math.ceil(2 * n / (d1 + 2)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -176,7 +190,9 @@ def propose_swaps(arr: LineArrangement, d1: int, d2: int, rng,
                   coord_range: int = 3, n_remove: int = 4,
                   n_add_per_remove: int = 24, exact_frac: float = 0.7,
                   b2_slack: int = 2, tabu=None, nontrivial=True,
-                  field=None):
+                  field=None, max_mult=None,
+                  ranker=None, ranked_k: int = 24,
+                  explore_frac: float = 0.1):
     """Sample candidate swaps (i_minus, L_plus).
 
     For each of `n_remove` random removal choices, build the Δb2-tiers over
@@ -190,6 +206,11 @@ def propose_swaps(arr: LineArrangement, d1: int, d2: int, rng,
     n = len(arr)
     b2_star = (n - 1) + d1 * d2
     proposals = []
+    if ranker is not None:
+        # WIDE generation: the surrogate ranks a large candidate set and
+        # only the top slice receives true evaluations downstream
+        n_remove = min(n, 3 * n_remove)
+        n_add_per_remove = 2 * n_add_per_remove
     removals = rng.permutation(n)[:n_remove]
     for i in removals:
         rest = LineArrangement([l for j, l in enumerate(arr.lines) if j != i])
@@ -224,12 +245,25 @@ def propose_swaps(arr: LineArrangement, d1: int, d2: int, rng,
         chosen = exact_tier[:k_exact] + slack_tier[:take - k_exact]
         for line in chosen:
             trial = LineArrangement(list(rest.lines) + [line])
-            if not is_valid_state(trial, n, nontrivial):
+            if not is_valid_state(trial, n, nontrivial, max_mult=max_mult):
                 continue
             if tabu is not None and canonical_lineset_key(trial) in tabu:
                 continue
             proposals.append((int(i), line, trial))
     rng.shuffle(proposals)
+    if ranker is not None and len(proposals) > ranked_k:
+        # DISCIPLINE: surrogate scores only ORDER the candidates; they are
+        # never logged as losses and never touch acceptance/certification.
+        scores = ranker.rank([t for (_, _, t) in proposals], d1, d2)
+        order = sorted(range(len(proposals)), key=lambda j: -scores[j])
+        k_top = max(1, int(round(ranked_k * (1.0 - explore_frac))))
+        top = [proposals[j] for j in order[:k_top]]
+        rest_idx = order[k_top:]
+        n_explore = min(ranked_k - k_top, len(rest_idx))
+        if n_explore > 0:
+            pick = rng.choice(len(rest_idx), size=n_explore, replace=False)
+            top.extend(proposals[rest_idx[int(p)]] for p in pick)
+        return top
     return proposals
 
 
@@ -247,10 +281,15 @@ class ChainEvaluator:
     """
 
     def __init__(self, n, d1, d2, w_b2=0.05, seed=0,
-                 refine_restarts=8, refine_iters=80):
+                 refine_restarts=8, refine_iters=80,
+                 m_target=None, w_m=0.1):
         self.n, self.d1, self.d2 = n, d1, d2
         self.b2_star = (n - 1) + d1 * d2
         self.w_b2 = w_b2
+        # optional epsilon-directed pull toward low maximal multiplicity
+        # (logged separately; never part of the certification gate)
+        self.m_target = m_target
+        self.w_m = w_m
         self.seed = seed
         self.refine_restarts = refine_restarts
         self.refine_iters = refine_iters
@@ -291,17 +330,29 @@ class ChainEvaluator:
         if loss is None:
             loss = self.screen_loss(arr)
         b2_gap = abs(arr.b2() - self.b2_star) / max(1, self.b2_star)
-        return loss + self.w_b2 * b2_gap
+        e = loss + self.w_b2 * b2_gap
+        if self.m_target is not None:
+            e += self.w_m * max(0, arr.max_multiplicity() - self.m_target)
+        return e
 
     def energy_components(self, arr, loss) -> dict:
         """Separately logged energy components (audit requirement): the
-        RAW Saito loss, the b2-shell penalty and weight, and the total.
-        Calibration NEVER appears here — engines rank by raw loss."""
+        RAW Saito loss, the b2-shell penalty and weight, the optional
+        m-target penalty, and the total.  Calibration NEVER appears here —
+        engines rank by raw loss."""
         b2_pen = abs(arr.b2() - self.b2_star) / max(1, self.b2_star)
+        m_pen = (max(0, arr.max_multiplicity() - self.m_target)
+                 if self.m_target is not None else 0)
         return {"raw_saito_loss": float(loss),
                 "b2_shell_penalty": float(b2_pen),
                 "b2_shell_weight": float(self.w_b2),
-                "total_energy": float(loss + self.w_b2 * b2_pen)}
+                "m_target_penalty": float(m_pen),
+                "m_target_weight": float(self.w_m if self.m_target
+                                         is not None else 0.0),
+                "total_energy": float(loss + self.w_b2 * b2_pen
+                                      + (self.w_m * m_pen
+                                         if self.m_target is not None
+                                         else 0.0))}
 
     def stats(self):
         return {"screen_evals": self.n_screen, "refine_evals": self.n_refine,

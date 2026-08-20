@@ -94,6 +94,8 @@ def main():
     ap.add_argument("--max-n", type=int, default=24)
     ap.add_argument("--max-parents-per-level", type=int, default=3)
     ap.add_argument("--coord-range", type=int, default=1)
+    ap.add_argument("--max-mult", type=int, default=None)
+    ap.add_argument("--surrogate", default=None)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -139,7 +141,8 @@ def main():
                     break
         io = CampaignIO(cell_dir, n, d1, d2, f"cascade-{args.engine}",
                         args.seed)
-        ev = ChainEvaluator(n, d1, d2, seed=args.seed)
+        ev = ChainEvaluator(n, d1, d2, seed=args.seed,
+                            m_target=args.max_mult)
         slice_end = min(deadline, time.time() + args.slice_minutes * 60)
         print(f"[{run_tag}] level n={n} cell ({n},{d1},{d2}): "
               f"{len(seeds)} seeds, slice "
@@ -147,7 +150,11 @@ def main():
 
         last_seeds = list(seeds)
         restarts = 0
-        pk = {"field": K, "coord_range": args.coord_range}
+        pk = {"field": K, "coord_range": args.coord_range,
+              "max_mult": args.max_mult}
+        if args.surrogate:
+            from surrogate import SurrogateRanker
+            pk["ranker"] = SurrogateRanker.load(args.surrogate)
         while time.time() < slice_end:
             seed_arr = seeds[restarts % len(seeds)]
             try:
