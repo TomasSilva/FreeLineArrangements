@@ -40,21 +40,23 @@ xargs -P 14 -L 1 -a "$JOBS_FILE" bash -c '
   set -- $0 "$@"
   mode=$1; shift
   if [ "$mode" = "cell" ]; then
-    n=$1; d1=$2; d2=$3; eng=$4; seed=$5; fd=$6
+    n=$1; d1=$2; d2=$3; eng=$4; seed=$5; fd=$6; mm=$7
+    MMARG=""
+    if [ -n "$mm" ]; then MMARG="--max-mult $mm"; fi
     if [ "$fd" = "qq" ]; then
-      dir="$OUT_ROOT/cells_qq/n${n}_d${d1}_${d2}"
+      dir="$OUT_ROOT/cells_qq/n${n}_d${d1}_${d2}$([ -n "$mm" ] && echo _m$mm)"
       mkdir -p "$dir"
       python experiments/run_swap_campaign.py \
           --n "$n" --d1 "$d1" --d2 "$d2" --engine "$eng" --seed "$seed" \
-          --wall-minutes "$WALL_MIN" --out "$dir" \
+          $MMARG --wall-minutes "$WALL_MIN" --out "$dir" \
           >> "$dir/log_${eng}_s${seed}.txt" 2>&1
     else
-      dir="$OUT_ROOT/cells_d${fd}/n${n}_d${d1}_${d2}"
+      dir="$OUT_ROOT/cells_d${fd}/n${n}_d${d1}_${d2}$([ -n "$mm" ] && echo _m$mm)"
       mkdir -p "$dir"
       python experiments/run_swap_campaign.py \
           --n "$n" --d1 "$d1" --d2 "$d2" --engine "$eng" --seed "$seed" \
           --field-d "$fd" --coord-range 1 \
-          --wall-minutes "$WALL_MIN" --out "$dir" \
+          $MMARG --wall-minutes "$WALL_MIN" --out "$dir" \
           >> "$dir/log_${eng}_s${seed}.txt" 2>&1
     fi
   elif [ "$mode" = "cascade" ]; then
