@@ -1,0 +1,73 @@
+#!/bin/bash
+#PBS -N swap_long
+#PBS -q par16
+#PBS -l nodes=1:ppn=16
+#PBS -l walltime=72:00:00
+#PBS -j oe
+
+# THREE-DAY unattended campaign: maximize new exact free arrangements,
+# climbing to n <= 30 via cascades; epsilon-frontier ceilings included.
+#
+# Unit line formats (jobs_K_tierG.txt / jobs_K_tierH.txt):
+#   cell N D1 D2 ENGINE SEED FIELD [MAXMULT]
+#   cascade START_N FIELD_D ENGINE SEED [MAX_N]
+# FIELD = qq or a quadratic discriminant (2,3,5,-1,-3).
+#
+# If the queue rejects 72h walltime, submit with an explicit override, e.g.:
+#   qsub -l walltime=48:00:00 -v JOBS_FILE=jobs_K_tierG.txt,WALL_MIN=2760 \
+#        pbs/step8_swap_long.pbs
+#
+# Submit:  qsub -v JOBS_FILE=jobs_K_tierG.txt pbs/step8_swap_long.pbs
+#          qsub -v JOBS_FILE=jobs_K_tierH.txt pbs/step8_swap_long.pbs
+
+cd "$PBS_O_WORKDIR"
+module load python/3.8.11-intel-2021.3.0
+source free_arr/bin/activate
+export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+JOBS_FILE=${JOBS_FILE:-jobs_K_tierG.txt}
+WALL_MIN=${WALL_MIN:-4260}          # 71h of the 72h walltime
+SLICE_MIN=${SLICE_MIN:-120}         # cascade level-slice length
+OUT_ROOT=${OUT_ROOT:-results_from_HPC/${PBS_JOBID%%.*}}
+mkdir -p "$OUT_ROOT"
+export OUT_ROOT WALL_MIN SLICE_MIN
+
+echo "== swap_long: $(wc -l < "$JOBS_FILE") units from $JOBS_FILE -> $OUT_ROOT (${WALL_MIN}min) =="
+date
+
+xargs -P 14 -L 1 -a "$JOBS_FILE" bash -c '
+  set -- $0 "$@"
+  mode=$1; shift
+  if [ "$mode" = "cell" ]; then
+    n=$1; d1=$2; d2=$3; eng=$4; seed=$5; fd=$6; mm=$7
+    MMARG=""; SUF=""
+    if [ -n "$mm" ]; then MMARG="--max-mult $mm"; SUF="_m$mm"; fi
+    if [ "$fd" = "qq" ]; then
+      dir="$OUT_ROOT/cells_qq/n${n}_d${d1}_${d2}${SUF}"
+      FARG=""
+    else
+      dir="$OUT_ROOT/cells_d${fd}/n${n}_d${d1}_${d2}${SUF}"
+      FARG="--field-d $fd --coord-range 1"
+    fi
+    mkdir -p "$dir"
+    python experiments/run_swap_campaign.py \
+        --n "$n" --d1 "$d1" --d2 "$d2" --engine "$eng" --seed "$seed" \
+        $FARG $MMARG --wall-minutes "$WALL_MIN" --out "$dir" \
+        >> "$dir/log_${eng}_s${seed}.txt" 2>&1
+  elif [ "$mode" = "cascade" ]; then
+    sn=$1; fd=$2; eng=$3; seed=$4; mn=$5
+    MNARG="--max-n ${mn:-30}"
+    dir="$OUT_ROOT/cells_d${fd}"
+    mkdir -p "$dir"
+    python experiments/run_cascade_campaign.py \
+        --start-n "$sn" --field-d "$fd" --engine "$eng" --seed "$seed" \
+        $MNARG --slice-minutes "$SLICE_MIN" \
+        --wall-minutes "$WALL_MIN" --out "$dir" \
+        >> "$dir/log_cascade_d${fd}_${eng}_s${seed}.txt" 2>&1
+  else
+    echo "unknown unit mode: $mode" >&2
+  fi
+'
+date
+echo "== done =="

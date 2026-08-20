@@ -1370,19 +1370,18 @@ def extend_arrangement(
             continue
         n_passed_filter += 1
 
-        # Exact verification (quadratic fields use the fast certificate
-        # path: same exact guarantees, plus the mod-p block prescreen)
+        # Exact verification via the fast certificate path for ALL fields
+        # (same exact guarantees as is_free: verified positive, exact
+        # negative; the mod-p prescreen rejects most candidates in int64,
+        # which is what makes n >= 24 lifts affordable in long campaigns)
         try:
-            if new_arr.coefficient_field() is not None:
-                from certificates import (find_certificate_fast,
-                                          verify_certificate)
-                cert, _status = find_certificate_fast(
-                    new_arr, target_exponents=target_exponents)
-                if cert is None or not verify_certificate(cert):
-                    continue
-                is_free, exps = True, (1,) + tuple(target_exponents)
-            else:
-                is_free, exps = new_arr.is_free()
+            from certificates import (find_certificate_fast,
+                                      verify_certificate)
+            cert, _status = find_certificate_fast(
+                new_arr, target_exponents=target_exponents)
+            if cert is None or not verify_certificate(cert):
+                continue
+            is_free, exps = True, (1,) + tuple(target_exponents)
         except Exception:
             continue
         if not is_free:
