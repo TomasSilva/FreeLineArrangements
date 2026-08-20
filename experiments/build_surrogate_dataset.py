@@ -56,19 +56,51 @@ def main():
     for root in args.roots:
         files += glob.glob(f"{root}/**/candidates.jsonl", recursive=True)
         files += glob.glob(f"{root}/**/certified.jsonl", recursive=True)
+        files += glob.glob(f"{root}/**/negatives.jsonl", recursive=True)
     files = sorted(set(files))
+
+    def archive_records(root):
+        """MAP-Elites archive elites: losses span the full range (the only
+        on-disk source of above-gate labels besides generated negatives).
+        The cell comes from the directory name n<N>_d<D1>_<D2>."""
+        import re as _re
+        for ap in glob.glob(f"{root}/**/archive_*.json", recursive=True):
+            m = _re.search(r"n(\d+)_d(\d+)_(\d+)", ap)
+            if not m:
+                continue
+            n_, d1_, d2_ = map(int, m.groups())
+            try:
+                arch = json.load(open(ap))
+            except Exception:
+                continue
+            for _, elites in arch.items():
+                for e in elites:
+                    if "lines" in e and "loss" in e:
+                        r = dict(e)
+                        r.update({"n": n_, "d1": d1_, "d2": d2_})
+                        yield r
 
     strata = {}                     # (cell, decade) -> list of records
     seen_lines = set()
     n_read = n_dupe = n_bad = 0
-    for path in files:
-        try:
-            fh = open(path)
-        except OSError:
-            continue
-        for line in fh:
+
+    def _records():
+        for path in files:
             try:
-                r = json.loads(line)
+                fh = open(path)
+            except OSError:
+                continue
+            for line in fh:
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    yield None
+        for root in args.roots:
+            yield from archive_records(root)
+
+    for r in _records():
+        if True:
+            try:
                 loss = float(r["loss"])
                 key = (r["n"], r["d1"], r["d2"])
             except Exception:
