@@ -1,6 +1,52 @@
 # FreeLineArrangements
 
-A toolkit for discovering **free line arrangements** in the complex projective plane CP². Combines a Transformer-based PPO agent with classical algebraic geometry constructions and a hybrid bootstrap-extension search. Designed to run on HPC clusters with parallel environments.
+A toolkit for discovering **free line arrangements** in the complex projective plane CP². Production discovery runs on discrete **swap/cascade engines** driven by the penalized Saito loss, over Q and five real/imaginary quadratic fields; every claim is backed by an exact symbolic Saito certificate. Earlier strategies (a Transformer-based PPO agent, hybrid bootstrap extension, direct supersolvable construction) remain in the repo and are documented below. Designed to run on HPC clusters with parallel workers.
+
+## The database (start here)
+
+**[`certified_free_arrangements.jsonl.gz`](certified_free_arrangements.jsonl.gz)** is a single-file, self-contained release of every certified discovery produced by the search:
+
+- **6,146 free line arrangements**, one per intersection-lattice isomorphism class (WL fingerprints, collision-checked by exact VF2 isomorphism tests), each given by its lowest-coordinate-height representative, **n = 9 … 28**;
+- **3,012 entries in the Dimca–Kühne–Pokora rarity class** ε = d1 − m_max ≥ 2, with ε up to **7** (n = 27, exponents (1, 13, 13), m_max = 6);
+- coefficient fields: Q (5,808), Q(i) (82), Q(√−3) (160), Q(√2) (1), Q(√3) (90), Q(√5) (5);
+- **every entry embeds its full exact Saito certificate** (θ1, θ2, the scalar c, the defining polynomial Q), so freeness of any single entry is machine-checkable from the file alone — no access to the raw result trees needed.
+
+The file is gzipped JSONL: line 1 is a `_meta` record (schema documentation, counts, ε-histogram, provenance, generating commit); every following line is one arrangement.
+
+```python
+import gzip, json
+
+with gzip.open("certified_free_arrangements.jsonl.gz", "rt") as f:
+    meta = json.loads(next(f))["_meta"]          # schema, counts, provenance
+    entries = [json.loads(line) for line in f]   # 6,146 entries
+
+# example query: rational arrangements with epsilon >= 5 and balanced exponents
+hits = [e for e in entries
+        if e["epsilon"] >= 5 and e["field"] == "QQ"
+        and e["exponents"][1] == e["exponents"][2]]
+```
+
+Each entry carries search-friendly metadata plus the proof:
+
+| Field | Meaning |
+|---|---|
+| `n`, `exponents` | number of lines; `[1, d1, d2]` with d1 + d2 = n − 1 |
+| `m_max`, `epsilon`, `dkp_rare` | max point multiplicity; ε = d1 − m_max; ε ≥ 2 and d1 < n − m_max |
+| `b2`, `t_vector`, `n_points` | second Betti number of the complement; {multiplicity k: t_k}; number of intersection points |
+| `supersolvable` | supersolvability of the intersection lattice |
+| `field`, `height` | `"QQ"` or `{type:"quadratic", d, name, embedding}`; max coordinate height |
+| `lines` | `[a, b, c]` per line (ax + by + cz = 0); rationals as `"p/q"`, quadratic-field elements as `"[u,v]"` meaning u + v·√d |
+| `lattice_hash` | WL fingerprint of the intersection lattice (dedup key) |
+| `certificate` | exact Saito certificate: lines, Q, θ1, θ2 (stacked coefficient vectors of their x, y, z components, graded-lex monomials), scalar c with det M(θ_E, θ1, θ2) = c·Q, c ≠ 0 |
+
+To re-verify an entry symbolically with this repository (over its declared field):
+
+```python
+from certificates import certificate_from_json, verify_certificate
+assert verify_certificate(certificate_from_json(entries[0]["certificate"]))
+```
+
+Every entry has already been re-verified this way end-to-end (`experiments/recheck_all_certificates.py`: 6,146/6,146 VERIFIED, zero failures), and the export itself (`experiments/export_database.py`) rebuilds each arrangement from its certificate's lines and cross-checks the lattice hash, b2 = (n − 1) + d1·d2 = Σ(m_P − 1), and Σ C(m_P, 2) = C(n, 2) before writing.
 
 > **2026-08 migration note.** The numerical search signal was replaced: the old
 > "smooth Saito loss" (angular ALS score over SVD null spaces) is mathematically
@@ -16,16 +62,17 @@ A toolkit for discovering **free line arrangements** in the complex projective p
 
 ## At a Glance
 
-The repo evolved through three discovery strategies, each addressing a regime where the previous one failed. Result counts are exact-certified discoveries; rows marked *historical* were produced with the old angular pre-filter/reward (their certificates remain valid):
+The repo evolved through four discovery strategies, each addressing a regime where the previous one failed. Result counts are exact-certified discoveries; rows marked *historical* were produced with the old angular pre-filter/reward (their certificates remain valid):
 
 | Strategy | Best for | Tool | Verified results |
 |---|---|---|---|
+| **Swap/cascade engines** (current production) | n up to 28, ε-frontier, quadratic fields | `experiments/run_swap_campaign.py`, `experiments/run_cascade_campaign.py` | **6,146 distinct certified lattice types** at n=9..28, incl. 3,012 with ε ≥ 2 — the [database file](certified_free_arrangements.jsonl.gz) above |
 | **Pure RL (PPO + Transformer)** | n ≤ 12 | `train`, `explore`, `verify-found` | 9,869 free arrangements at n=6..13 in 81h on HPC (*historical*: old reward signal) |
 | **Hybrid bootstrap extension** | n ≥ 14 | `extend` | 1,602 arrangements at n=13..18 + 1,774 at n=19 in <24h locally (*historical*: old 0.05 angular pre-filter) |
 | **Direct supersolvable construction** | All (n, d1, d2) cells | `construct` | One example per cell, instant, closed form |
 | **Δb2-targeted extension** | Filling unbalanced exponent cells | `extend --target-new-exponents` / `--all-targets` | Single n=12 supersolvable seed → 1,162 free n=13 arrangements covering all 6 exponent types |
 
-For **n ≥ 14** the recommended path is `construct --family all-supersolvable` (instant per-cell coverage) followed by `extend --all-targets` (rich non-supersolvable examples in every cell). See [Comprehensive Coverage](#comprehensive-coverage-of-all-exponent-types) below.
+Current production is the swap/cascade machinery — see [Current search: energy and engines](#current-search-energy-and-engines). The older paths remain usable; for quick per-cell coverage, `construct --family all-supersolvable` followed by `extend --all-targets` still works as documented below.
 
 ## Quickstart
 
@@ -105,11 +152,22 @@ saito.py             Reward shaping on the penalized Saito loss, polish_arrangem
                      legacy_invalid_angular_score (retired ALS score, regression only)
 penalized_saito.py   Corrected penalized Saito functional (Bombieri-Weyl norms, canonical
                      logarithmic residual, multistart MM optimizer on sphere products)
-certificates.py      Exact symbolic Saito certificates over Q (the only accepted proof of freeness)
+certificates.py      Exact symbolic Saito certificates over Q and quadratic fields (the only
+                     accepted proof of freeness)
+swap_search.py       Production search: swap moves, validity gates, ChainEvaluator energy,
+                     engines (greedy / walk / anneal / MAP-Elites), certify_state
+quadfield.py         Exact arithmetic over Q(sqrt d), d in {2, 3, 5, -1, -3} (QuadElem,
+                     Weil-restriction linear algebra, principal embeddings)
+novelty.py           WL lattice fingerprints, VF2 exact isomorphism checks, essentiality,
+                     supersolvability, coordinate height
+promotion.py         Verified promotion pipeline into the production discoveries.json
+surrogate.py         Optional proposal ranker (torch MLP; off in production)
 tests/               Mathematical regression suite (incl. an independent exact reference
                      implementation of the functional)
 benchmarks/          Validation study (lambda/beta sweeps, restart/iteration budgets, plots)
-experiments/         Extension-prefilter rerun + threshold refit; RL reward-arm comparison
+experiments/         Campaign drivers (run_swap_campaign, run_cascade_campaign), database
+                     export (export_database), full re-verification (recheck_all_certificates),
+                     discovery summaries (summarize_discoveries), prefilter reruns
 environment.py       Gym-like RL environment with pool and singularity-aware candidate modes
 model.py             Transformer Actor-Critic with cross-attention over candidate lines
 train.py             PPO training with adaptive triple curriculum and vectorized environments
@@ -224,7 +282,7 @@ The `algebraic_score()` function combines Levels 1 and 2 into a single score in 
 
 When target exponents (d1, d2) are specified, Tier 1 instead measures the normalized distance from b2 to the specific target b2 = (n-1) + d1 * d2, scaled by target_b2 itself (not the maximum possible b2) so that high-b2 targets get sharper gradient signal.
 
-### Full Reward Composition
+### Full Reward Composition (RL arm — historical pipeline)
 
 The reward returned to the RL agent at each step is:
 
@@ -241,6 +299,39 @@ R = w_comb   * combinatorial_score(A)         # 0.3 -- b2 yields integer exponen
 ```
 
 For n > `skip_exact_above` (default 12), the terminal bonus is replaced by a graded algebraic score bonus: 80% of w_free when alg_score > 0.95, 40% when > 0.80.
+
+## Current search: energy and engines
+
+Production discovery (the runs behind the database file) uses **fixed-cardinality replacement-move search** (`swap_search.py`): a state is an arrangement of exactly n distinct lines in a target cell (n, d1, d2) with d1 + d2 = n − 1, and a move swaps one line, A′ = (A ∖ {L−}) ∪ {L+}. Replacement candidates come from a field-closed singularity pool (lines through pairs of existing intersection points) plus a small integer grid over Q — or a small O_K grid for quadratic-field campaigns — and are Δb2-masked toward the target b2 shell. Hard validity rejects (equivalent to infinite energy): duplicate lines, non-essential states, pencils/near-pencils (m_max ≤ n − 2 in nontrivial cells), and optionally a multiplicity ceiling `--max-mult` for ε-directed cells.
+
+### Search energy
+
+The penalized Saito loss is defined at every such state (the degree condition holds identically at fixed n), so it serves as a dense energy (`ChainEvaluator` in [swap_search.py](swap_search.py)):
+
+```
+E(A) = raw_penalized_saito_loss(A; d1, d2)          # Level 2 signal — never a proof
+     + w_b2 * |b2(A) − b2*| / max(1, b2*)           # b2-shell pull; w_b2 = 0.05, b2* = (n−1) + d1·d2
+     + w_m  * max(0, m_max(A) − m_target)           # optional ε-directed term; w_m = 0.1, off by default
+```
+
+The b2 term lets chains make bounded off-shell excursions; the optional m-target term pulls toward low maximal multiplicity (high ε = d1 − m_max, the DKP rarity direction). All components are logged separately per candidate (`raw_saito_loss`, `b2_shell_penalty`, `m_target_penalty`, `total_energy`), and **the certification gate ranks by raw loss only** — the shaping terms steer the walk, never the claim. Screening uses the cached `rl`-profile loss (4 restarts × 40 MM sweeps); accepted states are refined at the `search` profile (8 × 80) with warm starts carried along the chain.
+
+### Engines
+
+`experiments/run_swap_campaign.py --engine {greedy, walk, anneal, me}`:
+
+| Engine | What it does |
+|---|---|
+| `greedy` | best-of-k swap descent with a tabu set on canonical line sets |
+| `walk` | energy-biased random walk (exploration / baseline) |
+| `anneal` | simulated annealing — Metropolis acceptance on E with a temperature schedule |
+| `me` | **MAP-Elites** quality-diversity archive: behavior descriptor (m_max, t3-bucket, b2-offset); each cell keeps a reservoir of up to 8 elites with *distinct lattice hashes*, ordered by (not-certified, loss, height), so coordinate-level polish can never evict lattice diversity. Deterministic for a fixed seed. |
+
+On top of the cell engines, `experiments/run_cascade_campaign.py` runs **cascades**: search a level n, harvest the non-supersolvable discoveries as lift seeds, target the induced (n+1) cells via the exact Δb2 formula, and repeat up to `--max-n` (campaigns have reached n = 28). Both drivers take `--field-d {2, 3, 5, −1, −3}` to run the identical loop over Q(√d) with exact O_K coordinate tokens, and `--max-mult` for ε-frontier ceilings. An optional `--surrogate` ranker (torch MLP, `surrogate.py`) can reorder swap proposals; it is off in production and by design only chooses *which* candidates get true evaluations — surrogate scores are never logged as losses and never touch acceptance or certification.
+
+### Certification and promotion
+
+Any state whose **raw** loss falls below threshold goes to the exact symbolic Saito check over its declared coefficient field (`certify_state` → `certificates.py`): exact logarithmicity of both derivations and det M(θ_E, θ1, θ2) = c·Q with c ≠ 0. Numerically promising candidates and exactly certified discoveries are separate output streams (`candidates.jsonl` / `certified.jsonl` + certificate JSON files); nothing in the swap machinery writes the repo-root `discoveries.json` — promotion into it goes through the verified pipeline (`promotion.py`) only. The HPC driver is [pbs/step8_swap_long.pbs](pbs/step8_swap_long.pbs) (72h multi-unit campaigns, cells + cascades via `xargs -P`).
 
 ## Model
 
@@ -488,17 +579,7 @@ python main.py discoveries
 
 ### Visualize an Arrangement
 
-[visualize_new.ipynb](visualize_new.ipynb) plots a line arrangement in the affine chart `z = 1`. Each projective line `ax + by + cz = 0` becomes `ax + by + c = 0` in this chart. The single exception is the line at infinity `z = 0` (i.e., a line with `(a, b) = (0, 0)` after projective normalization), which is rendered as a dotted boundary circle. Intersection points are marked with marker size scaled by multiplicity. Pairs of parallel affine lines correctly do NOT show an affine intersection — their common point lies at infinity.
-
-```python
-from visualize_new import draw_arrangement   # or open the notebook directly
-draw_arrangement([
-    "(1x+0y+0z=0)",   # x = 0
-    "(0x+1y+0z=0)",   # y = 0
-    "(1x+1y+-1z=0)",  # x + y = 1
-    "(0x+0y+1z=0)",   # line at infinity z = 0
-], xlim=(-2, 2), ylim=(-2, 2))
-```
+[visualize_arrangements.ipynb](visualize_arrangements.ipynb) draws arrangements in the projective chart `z = 1` from exact line coefficients: exact intersection points colored by multiplicity, PCA whitening for well-proportioned figures, and gallery grids. `load_by_hash("1a1488047e12")` pulls a discovery from the local result trees by lattice-hash prefix; `from_lines([...])` builds one directly from `[a, b, c]` coefficient lists — e.g. the `lines` field of any entry in [`certified_free_arrangements.jsonl.gz`](certified_free_arrangements.jsonl.gz). Real fields only (complex-coordinate arrangements raise); points at infinity in the chosen chart are skipped.
 
 ## HPC Deployment
 
