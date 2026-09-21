@@ -660,3 +660,203 @@ def certificate_from_json(d):
         'lines': [tuple(_parse_exact_scalar(v, K) for v in coords)
                   for coords in d['lines']],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Non-freeness witnesses (Terao-stress pipeline)
+#
+# A serialized, independently re-verifiable EXACT proof that an arrangement
+# is not free — the negative-side counterpart of the Saito certificate.
+# Methods (each a complete argument on its own):
+#
+#   W1 'terao_factorization_obstruction': chi(A, t)/(t - 1) does not factor
+#      as (t - e1)(t - e2) with admissible nonnegative integers (exact,
+#      lattice-only; candidate_exponents() is None).
+#   W3 'forced_pair_degree_dim': the exponents of any free structure are
+#      forced to the unique candidate pair (d1, d2); a free arrangement
+#      would have dim_K D(A)_{d1} = free_module_dims(d1, d1, d2); the exact
+#      computed dimension is smaller, so no free structure exists.
+#   W5 'forced_pair_matrix_zero': the exact bilinear pair matrix C for the
+#      forced pair is zero (find_certificate_fast negative — see module
+#      docstring for why that negative is exact).
+#
+# mod-p results are recorded as prescreen provenance only, NEVER as the
+# argument.  The numerical loss never appears anywhere in a witness.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _derivation_rows_sha256(arr, d):
+    """Deterministic hash of the exact degree-d derivation system, in the
+    witness's own line order (the verifier reparses the recorded lines in
+    order and must reproduce this hash)."""
+    import hashlib
+    h = hashlib.sha256()
+    for row in arr._derivation_rows(d):
+        h.update(("|".join(str(v) for v in row) + "\n").encode())
+    return h.hexdigest()
+
+
+def nonfreeness_certificate(arr: LineArrangement, primes=(1000003, 2000003),
+                            corroborate=False):
+    """Exact non-freeness witness or None.
+
+    Returns (witness_dict, status) with status in
+    {'nonfree_certified', 'free_or_unresolved'} — an exception yields
+    ('free_or_unresolved' with the exception noted) and is NEVER a claim.
+
+    Order of work: W1 (lattice arithmetic, free) -> mod-p prescreens
+    (recorded, not evidence) -> W3 exact dimension in degree d1 ->
+    fallback W5 exact pair-matrix argument.  `corroborate=True` runs the
+    (expensive) W5 path even when W3 already decided, and records the
+    agreement.
+    """
+    import subprocess
+    import time as _time
+    try:
+        K = arr.coefficient_field()
+        n = len(arr)
+        b2 = arr.b2()
+        base = {
+            'version': 1,
+            'lines': [str(l) for l in arr.lines],
+            'field': _field_tag(K),
+            'n': n,
+            'b2': b2,
+        }
+        try:
+            rev = subprocess.check_output(
+                ['git', 'rev-parse', 'HEAD'], text=True,
+                stderr=subprocess.DEVNULL).strip()
+        except Exception:
+            rev = None
+        base['git_rev'] = rev
+        base['timestamp'] = _time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                           _time.gmtime())
+
+        exps = arr.candidate_exponents()
+        if exps is None:
+            product = b2 - (n - 1)
+            disc = (n - 1) ** 2 - 4 * product
+            base.update({
+                'method': 'terao_factorization_obstruction',
+                'forced_pair': None,
+                'chi_reduced': f't**2 - {n - 1}*t + {product}',
+                'discriminant': disc,
+            })
+            return base, 'nonfree_certified'
+
+        d1, d2 = exps
+        base['forced_pair'] = [d1, d2]
+        if d1 < 1:
+            # (0, n-1): pencil-type candidate exponents; the dimension
+            # argument does not apply — no witness claimed.
+            return None, 'free_or_unresolved'
+
+        base['modp_prescreen'] = {
+            str(p): bool(modp_nullity_reject(arr, d1, d2, p=p))
+            for p in primes}
+
+        trivial = _dim_S(d1 - 1)
+        required = free_module_dims(d1, d1, d2)
+        dim = arr.derivation_space_dim(d1)
+        base.update({
+            'd_checked': d1,
+            'dim_computed': int(dim),
+            'trivial_dim': int(trivial),
+            'required_if_free': int(required),
+            'matrix_shape': [n * (d1 + 1),
+                             3 * len(LineArrangement._monoms(d1))],
+            'matrix_sha256': _derivation_rows_sha256(arr, d1),
+        })
+        if dim < required:
+            base['method'] = 'forced_pair_degree_dim'
+            if corroborate:
+                _, status = find_certificate_fast(arr,
+                                                  target_exponents=(d1, d2))
+                base['corroboration'] = status
+            return base, 'nonfree_certified'
+
+        # dimension is consistent with freeness — decide by the exact
+        # pair-matrix argument (complete: certified or not_target_free)
+        cert, status = find_certificate_fast(arr, target_exponents=(d1, d2))
+        if status == 'certified':
+            return None, 'free_or_unresolved'
+        if status in ('not_target_free', 'modp_reject'):
+            # modp_reject inside find_certificate_fast is the SOUND
+            # nullity rejection (see modp_nullity_reject); for the shipped
+            # witness we insist on the char-0 argument:
+            if status == 'modp_reject':
+                _, status2 = find_certificate_fast(
+                    arr, target_exponents=(d1, d2), prescreen_prime=None)
+                if status2 == 'certified':
+                    return None, 'free_or_unresolved'
+                if status2 != 'not_target_free':
+                    return None, 'free_or_unresolved'
+            base['method'] = 'forced_pair_matrix_zero'
+            return base, 'nonfree_certified'
+        return None, 'free_or_unresolved'
+    except Exception as e:            # noqa: BLE001 — never a nonfree proof
+        return None, f'free_or_unresolved(exception:{e})'
+
+
+def nonfreeness_to_json(w):
+    """Witnesses are built JSON-ready (exact ints/strings only)."""
+    import json as _json
+    _json.dumps(w)                    # fail fast on non-serializable data
+    return dict(w)
+
+
+def nonfreeness_from_json(d):
+    return dict(d)
+
+
+def verify_nonfreeness_certificate(w) -> bool:
+    """Re-verify a non-freeness witness FROM ITS LINES ALONE.
+
+    Reparses the arrangement, recomputes every recorded quantity and the
+    mathematical argument from scratch.  No stored number is trusted.
+    """
+    try:
+        from novelty import parse_line_str
+        tag = w.get('field', 'QQ')
+        K = QuadraticField.from_json(tag)
+        arr = LineArrangement([parse_line_str(s, field=K)
+                               for s in w['lines']])
+        n = len(arr)
+        b2 = arr.b2()
+        if n != int(w['n']) or b2 != int(w['b2']):
+            return False
+        actual_K = arr.coefficient_field()
+        if _field_tag(actual_K) != tag and actual_K is not None:
+            return False
+        exps = arr.candidate_exponents()
+        method = w.get('method')
+
+        if method == 'terao_factorization_obstruction':
+            return exps is None
+
+        if exps is None or list(exps) != list(w.get('forced_pair') or []):
+            return False
+        d1, d2 = exps
+
+        if method == 'forced_pair_degree_dim':
+            trivial = _dim_S(d1 - 1)
+            required = free_module_dims(d1, d1, d2)
+            if int(w['trivial_dim']) != trivial or \
+                    int(w['required_if_free']) != required:
+                return False
+            if int(w['d_checked']) != d1:
+                return False
+            if _derivation_rows_sha256(arr, d1) != w['matrix_sha256']:
+                return False
+            dim = arr.derivation_space_dim(d1)
+            return dim == int(w['dim_computed']) and dim < required
+
+        if method == 'forced_pair_matrix_zero':
+            _, status = find_certificate_fast(arr,
+                                              target_exponents=(d1, d2),
+                                              prescreen_prime=None)
+            return status == 'not_target_free'
+
+        return False
+    except Exception:                 # noqa: BLE001
+        return False

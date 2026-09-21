@@ -226,3 +226,67 @@ FIELD_SEED_REGISTRY = {
     (-1, 15): [g413],
     (5, 15): [h3_15],
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ziegler pair (Terao-stress negative control)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Triangular-prism configuration on 6 points: two triangles (0,1,2),
+# (3,4,5) joined by a matching.  9 lines = the edges; each point lies on
+# 3 lines -> 6 triple points, 18 double points, b2 = 30, and
+# chi(A, t)/(t-1) = t^2 - 8t + 22 has no integer roots — every
+# realization of this lattice is NON-free (Terao factorization).  The
+# classical Ziegler phenomenon: the special member (all 6 triple points
+# on a smooth conic) has a different graded derivation-module structure
+# than the generic member, with identical combinatorics.
+_ZIEGLER_EDGES = [(0, 1), (1, 2), (0, 2), (3, 4), (4, 5), (3, 5),
+                  (0, 3), (1, 4), (2, 5)]
+
+
+def _lines_through_points(points, edges):
+    lines = [ProjectiveLine.from_two_points(points[i], points[j])
+             for i, j in edges]
+    assert all(l is not None for l in lines)
+    assert len({l.coords for l in lines}) == len(edges)
+    return LineArrangement(lines)
+
+
+def ziegler_pair():
+    """(special, generic): 9-line arrangements with isomorphic lattices
+    (6 triple + 18 double points); the special member's triple points lie
+    on the smooth conic xz = y^2, the generic member's do not.  Both are
+    non-free (validated by `validate_ziegler_pair`, exercised in
+    tests/test_ziegler.py)."""
+    conic_pts = [(Rational(1), Rational(t), Rational(t) ** 2)
+                 for t in (0, 1, -1, 2, -2, 3)]
+    generic_pts = [
+        (Rational(1), Rational(0), Rational(0)),
+        (Rational(1), Rational(1), Rational(1)),
+        (Rational(1), Rational(-1), Rational(2)),
+        (Rational(1), Rational(2), Rational(-1)),
+        (Rational(1), Rational(3), Rational(5)),
+        (Rational(0), Rational(1), Rational(3)),
+    ]
+    return (_lines_through_points(conic_pts, _ZIEGLER_EDGES),
+            _lines_through_points(generic_pts, _ZIEGLER_EDGES))
+
+
+def validate_ziegler_pair(special, generic):
+    """Frozen gate: profile {3:6, 2:18}, b2 = 30, no candidate exponents
+    (=> both non-free by Terao factorization), isomorphic lattices, and
+    the conic detector separates the two members."""
+    from novelty import lattices_isomorphic
+    from geometry import special_position_profile
+    for arr in (special, generic):
+        if len(arr) != 9 or _profile(arr) != {3: 6, 2: 18}:
+            return False
+        if arr.b2() != 30 or arr.candidate_exponents() is not None:
+            return False
+    if not lattices_isomorphic(special, generic):
+        return False
+    ps = special_position_profile(special)
+    pg = special_position_profile(generic)
+    smooth = [c for c in ps['conics'] if c['size'] == 6
+              and not c['degenerate'] and not c.get('implied')]
+    return len(smooth) == 1 and pg['conics'] == []
