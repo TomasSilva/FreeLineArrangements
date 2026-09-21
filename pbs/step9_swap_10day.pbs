@@ -1,0 +1,126 @@
+#!/bin/bash
+#PBS -N swap10d
+#PBS -q par16
+#PBS -l nodes=1:ppn=16
+#PBS -l walltime=240:00:00
+#PBS -j oe
+
+# TEN-DAY unattended campaign (CENAPAD LOVELACE).
+#
+# DEFAULT = TERAO-CANDIDATE HUNT (jobs_M_nondiv.txt, WDIV=0.1): search for
+# free arrangements whose lattice is NOT divisionally free (Abe: a line H
+# with |A^H|-1 in {d1,d2} makes freeness combinatorial, so such lattices
+# can never host a Terao counterexample).  Soft energy penalty on
+# divisional lines, MAP-Elites non-divisional descriptor bit, certification
+# priority for non-divisional candidates, and most units seeded from the
+# five rational non-divisional lattices of the database
+# (swap_nondiv_seeds/, directed seed mode).
+#
+# EPSILON/CARDINALITY VARIANT (the earlier design): large n via cascades
+# and large multiplicity gaps via ceiling cells:
+#   qsub -v JOBS_FILE=jobs_L_10day.txt,WDIV=0 pbs/step9_swap_10day.pbs
+#
+# SCRATCH DISCIPLINE (LOVELACE): all runtime output goes to /work/tomas.
+#   $PBS_O_WORKDIR ($HOME project dir) is read-only at runtime: code, venv,
+#   jobs file, committed lift seeds.  Results/logs/tmp live under a
+#   job-specific dir /work/tomas/<jobname>_<jobid>; only final results are
+#   rsync'ed back to $PBS_O_WORKDIR/results_from_HPC/<jobid> at the end
+#   (plus a periodic safety sync).  The scratch dir is NOT deleted.
+#
+# Unit line formats (jobs_L_10day.txt):
+#   cell N D1 D2 ENGINE SEED FIELD [MAXMULT]
+#   cascade START_N FIELD_D ENGINE SEED [MAX_N]
+# FIELD = qq or a quadratic discriminant (2,3,5,-1,-3).
+#
+# Submit:  qsub pbs/step9_swap_10day.pbs
+# If the queue rejects 240h, override:
+#   qsub -l walltime=120:00:00 -v WALL_MIN=7000 pbs/step9_swap_10day.pbs
+
+# ── code root (read-only at runtime) ────────────────────────────────────────
+CODE_ROOT="$PBS_O_WORKDIR"
+cd "$CODE_ROOT"
+module load python/3.8.11-intel-2021.3.0
+source free_arr/bin/activate
+export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+
+# ── job-specific scratch on /work ───────────────────────────────────────────
+JOB_ID=${PBS_JOBID%%.*}
+SCRATCH="/work/tomas/${PBS_JOBNAME:-swap10d}_${JOB_ID}"
+OUT_ROOT="$SCRATCH/results"
+LOG_ROOT="$SCRATCH/logs"
+mkdir -p "$OUT_ROOT" "$LOG_ROOT" "$SCRATCH/tmp"
+export TMPDIR="$SCRATCH/tmp"
+
+JOBS_FILE=${JOBS_FILE:-jobs_M_nondiv.txt}
+WALL_MIN=${WALL_MIN:-14100}         # 235h of the 240h walltime
+SLICE_MIN=${SLICE_MIN:-180}         # cascade level-slice length
+WDIV=${WDIV:-0.1}                   # divisional-line penalty weight; 0 = off
+DIV_CAP=${DIV_CAP:-25}              # divisional certifications per unit
+if [ "$WDIV" != "0" ]; then
+  # directed hunt: designated non-divisional seeds first, general lift
+  # seeds as the fallback for cells without them
+  DIVARGS="--w-div $WDIV --div-cert-cap $DIV_CAP --seeds-dir swap_nondiv_seeds swap_lift_seeds"
+  SEEDMODE="--seed-mode directed"
+else
+  DIVARGS=""
+  SEEDMODE=""
+fi
+export CODE_ROOT OUT_ROOT LOG_ROOT WALL_MIN SLICE_MIN DIVARGS SEEDMODE
+
+# ── final + periodic copy-back of results to $HOME ──────────────────────────
+FINAL_DIR="$CODE_ROOT/results_from_HPC/$JOB_ID"
+sync_back () {
+  mkdir -p "$FINAL_DIR"
+  rsync -a "$OUT_ROOT/" "$FINAL_DIR/" 2>> "$LOG_ROOT/rsync_err.txt"
+}
+trap sync_back EXIT
+( while sleep 21600; do sync_back; done ) &   # safety sync every 6h
+SYNC_PID=$!
+
+echo "== swap10d: $(wc -l < "$JOBS_FILE") units from $JOBS_FILE"
+echo "==   scratch: $SCRATCH   (results -> $FINAL_DIR at end)"
+echo "==   wall: ${WALL_MIN}min  slices: ${SLICE_MIN}min  w_div: ${WDIV} =="
+date
+
+xargs -P 14 -L 1 -a "$JOBS_FILE" bash -c '
+  set -- $0 "$@"
+  mode=$1; shift
+  if [ "$mode" = "cell" ]; then
+    n=$1; d1=$2; d2=$3; eng=$4; seed=$5; fd=$6; mm=$7
+    MMARG=""; SUF=""
+    # one output dir PER UNIT (engine+seed suffix): several units may share
+    # a cell, and they must never share certified.jsonl / certificate files
+    if [ -n "$mm" ]; then MMARG="--max-mult $mm"; SUF="_m$mm"; fi
+    if [ "$fd" = "qq" ]; then
+      dir="$OUT_ROOT/cells_qq/n${n}_d${d1}_${d2}${SUF}_${eng}_s${seed}"
+      FARG=""
+    else
+      dir="$OUT_ROOT/cells_d${fd}/n${n}_d${d1}_${d2}${SUF}_${eng}_s${seed}"
+      FARG="--field-d $fd --coord-range 1"
+    fi
+    mkdir -p "$dir"
+    python "$CODE_ROOT/experiments/run_swap_campaign.py" \
+        --n "$n" --d1 "$d1" --d2 "$d2" --engine "$eng" --seed "$seed" \
+        $FARG $MMARG $DIVARGS $SEEDMODE \
+        --wall-minutes "$WALL_MIN" --out "$dir" \
+        >> "$LOG_ROOT/cell_n${n}_d${d1}_${d2}${SUF}_${eng}_s${seed}.txt" 2>&1
+  elif [ "$mode" = "cascade" ]; then
+    sn=$1; fd=$2; eng=$3; seed=$4; mn=$5
+    MNARG="--max-n ${mn:-32}"
+    dir="$OUT_ROOT/cells_d${fd}"
+    mkdir -p "$dir"
+    python "$CODE_ROOT/experiments/run_cascade_campaign.py" \
+        --start-n "$sn" --field-d "$fd" --engine "$eng" --seed "$seed" \
+        $MNARG $DIVARGS --slice-minutes "$SLICE_MIN" \
+        --wall-minutes "$WALL_MIN" --out "$dir" \
+        >> "$LOG_ROOT/cascade_d${fd}_${eng}_s${seed}.txt" 2>&1
+  else
+    echo "unknown unit mode: $mode" >&2
+  fi
+'
+date
+kill "$SYNC_PID" 2>/dev/null
+sync_back
+echo "== done; results copied to $FINAL_DIR (scratch kept at $SCRATCH) =="

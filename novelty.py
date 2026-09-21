@@ -225,6 +225,37 @@ def check_supersolvable_consistency(arr: LineArrangement, exponents) -> bool:
     return any(tuple(sorted((1, m - 1, n - m))) == exp_set for _, m in mps)
 
 
+def points_per_line(arr: LineArrangement):
+    """Number of intersection points on each line (lattice data)."""
+    counts = [0] * len(arr)
+    for idx in arr.intersection_points().values():
+        for i in idx:
+            counts[i] += 1
+    return counts
+
+
+def n_divisional_lines(arr: LineArrangement, d1: int, d2: int) -> int:
+    """Number of lines H with |A^H| - 1 in {d1, d2}.
+
+    Rank-3 form of Abe's division theorem: if chi(A, t) =
+    (t-1)(t-d1)(t-d2) and some line carries exactly d1 + 1 or d2 + 1
+    intersection points, then A is (divisionally) free — and that freeness
+    is COMBINATORIAL, so such a lattice can never host a Terao
+    counterexample.  For a free arrangement with exponents (1, d1, d2) the
+    count is 0 iff the lattice is not divisionally free via a line.  Off
+    the b2 shell the target pair is used as the proxy (search signal
+    only)."""
+    return sum(1 for c in points_per_line(arr) if c - 1 in (d1, d2))
+
+
+def expected_moduli_dim_rank3(arr: LineArrangement) -> int:
+    """Naive expected dimension of the realization space mod PGL3:
+    2n - sum over m>=3 points of (m - 2) - 8 (triage heuristic: <= 0
+    suggests a rigid lattice)."""
+    return (2 * len(arr)
+            - sum(m - 2 for m in arr.multiplicities() if m >= 3) - 8)
+
+
 def coordinate_height(arr: LineArrangement) -> int:
     """Max |numerator|/|denominator| over all line coordinates (elite
     tie-breaker: low-height representatives certify faster).

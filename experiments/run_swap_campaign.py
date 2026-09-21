@@ -53,8 +53,15 @@ class CampaignIO:
     certification work (each lattice hash is certified at most once per
     campaign invocation; repeats are recorded, not re-proved)."""
 
-    def __init__(self, out_dir, n, d1, d2, engine, seed):
+    def __init__(self, out_dir, n, d1, d2, engine, seed,
+                 div_cert_cap=None):
         self.out = out_dir
+        # non-divisional-directed campaigns: cap on exact certifications
+        # of DIVISIONALLY FREE candidates per unit (None = no priority
+        # screen).  Divisional freeness is combinatorial (Abe), so those
+        # lattices can never host a Terao counterexample; exact-check time
+        # is concentrated on non-divisional candidates.
+        self.div_cert_cap = div_cert_cap
         os.makedirs(os.path.join(out_dir, "certificates"), exist_ok=True)
         self.n, self.d1, self.d2 = n, d1, d2
         self.engine, self.seed = engine, seed
@@ -105,6 +112,20 @@ class CampaignIO:
                 self.counters["ss_cert_deferred"] = \
                     self.counters.get("ss_cert_deferred", 0) + 1
                 return
+        # certification-priority screen for non-divisional-directed
+        # campaigns: same discipline as the SS cap — divisional candidates
+        # beyond the cap are recorded as candidates, never lost, just not
+        # exact-checked.  Never affects soundness.
+        n_div = None
+        if self.div_cert_cap is not None:
+            from novelty import n_divisional_lines
+            n_div = n_divisional_lines(arr, self.d1, self.d2)
+            if n_div > 0 and \
+                    self.counters.get("div_certified", 0) >= self.div_cert_cap:
+                self.tried_hashes[h] = "div_cert_deferred"
+                self.counters["div_cert_deferred"] = \
+                    self.counters.get("div_cert_deferred", 0) + 1
+                return
         self.counters["cert_attempts"] += 1
         cert = certify_state(arr, self.d1, self.d2)
         if cert is None:
@@ -134,6 +155,17 @@ class CampaignIO:
             "supersolvable": ss_flag,
             "wall_s": time.time() - self.t0,
         })
+        if n_div is not None:
+            from novelty import expected_moduli_dim_rank3
+            entry["divisional_lines"] = int(n_div)
+            entry["divisional"] = bool(n_div > 0)
+            entry["expected_moduli_dim"] = expected_moduli_dim_rank3(arr)
+            key = "div_certified" if n_div > 0 else "nondiv_certified"
+            self.counters[key] = self.counters.get(key, 0) + 1
+            if n_div == 0:
+                print(f"  [NON-DIVISIONAL] lattice={h[:12]} "
+                      f"ss={ss_flag} expected_moduli_dim="
+                      f"{entry['expected_moduli_dim']}", flush=True)
         with open(self.cert_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
         print(f"  [CERTIFIED #{self.counters['certified']}] "
@@ -144,6 +176,10 @@ class CampaignIO:
 
 LIFT_SEEDS_DIR = "swap_lift_seeds"   # repo-root, committed; HPC gets it
                                      # via git pull
+# Seed directories searched IN ORDER; the first one holding a file for the
+# cell wins (so a directed campaign can put e.g. swap_nondiv_seeds first
+# and fall back to the general lift seeds elsewhere).  Set by --seeds-dir.
+SEEDS_DIRS = [LIFT_SEEDS_DIR]
 
 
 def load_lift_seeds(n, d1, d2, repo_root="."):
@@ -152,9 +188,13 @@ def load_lift_seeds(n, d1, d2, repo_root="."):
     time; here it is only a START STATE, so no claim rests on it."""
     import json as _json
     from novelty import parse_line_str
-    path = os.path.join(repo_root, LIFT_SEEDS_DIR,
-                        f"n{n}_d{d1}_{d2}.json")
-    if not os.path.exists(path):
+    path = None
+    for sd in SEEDS_DIRS:
+        cand = os.path.join(repo_root, sd, f"n{n}_d{d1}_{d2}.json")
+        if os.path.exists(cand):
+            path = cand
+            break
+    if path is None:
         return []
     out = []
     for e in _json.load(open(path)).get("seeds", []):
@@ -229,6 +269,25 @@ def build_seeds(n, d1, d2, rng, coord_range, mode="mixed", n_seeds=6,
     base = double_pencil_seed(n, d1, d2)
     # lifted non-SS seeds take priority over the supersolvable basin
     lifted = load_lift_seeds(n, d1, d2, repo_root)
+    if mode == "directed":
+        # directed campaigns: ONLY the designated seeds and their k-swap
+        # neighbourhoods (no supersolvable/random basins); cells without
+        # designated seeds fall back to the mixed policy
+        if lifted:
+            seeds.extend(lifted)
+            for lft in lifted:
+                for k in (1, 2, 3):
+                    seeds.append(perturb_k_swaps(lft, k, rng,
+                                                 coord_range=coord_range))
+            seen, out = set(), []
+            for s in seeds:
+                key = canonical_lineset_key(s)
+                if key not in seen and is_valid_state(s, n,
+                                                      nontrivial=(d1 >= 2)):
+                    seen.add(key)
+                    out.append(s)
+            return out[:max(n_seeds, 8)]
+        mode = "mixed"
     seeds.extend(lifted)
     for lft in lifted[:2]:
         seeds.append(perturb_k_swaps(lft, 1, rng, coord_range=coord_range))
@@ -285,6 +344,21 @@ def main():
                          "are generated WIDE and the learned ranker selects "
                          "which receive true evaluations; scores never "
                          "touch losses, acceptance or certification")
+    ap.add_argument("--w-div", type=float, default=0.0,
+                    help="non-divisional-directed campaign (Terao "
+                         "candidates): soft energy penalty w_div * (#lines "
+                         "H with |A^H|-1 in {d1,d2}) / n, MAP-Elites "
+                         "non-divisional descriptor bit, and certification "
+                         "priority for non-divisional candidates; 0 = off "
+                         "(default behavior unchanged)")
+    ap.add_argument("--div-cert-cap", type=int, default=25,
+                    help="with --w-div > 0: max exact certifications of "
+                         "DIVISIONAL candidates per unit (the rest are "
+                         "recorded as candidates, not exact-checked)")
+    ap.add_argument("--seeds-dir", nargs="+", default=None,
+                    help="seed directories searched in order (first with "
+                         "a file for the cell wins); default "
+                         "swap_lift_seeds")
     ap.add_argument("--allow-baseline", action="store_true",
                     help="permit baseline classes d1=0 (pencil) and d1=1 "
                          "(near-pencil); these never count as nontrivial "
@@ -323,9 +397,13 @@ def main():
         "allowed_pairs_policy": "nontrivial d1>=2 unless --allow-baseline",
         "provenance": runtime_provenance("."),
     }
-    io = CampaignIO(args.out, n, d1, d2, args.engine, args.seed)
+    if args.seeds_dir:
+        SEEDS_DIRS[:] = list(args.seeds_dir)
+    io = CampaignIO(args.out, n, d1, d2, args.engine, args.seed,
+                    div_cert_cap=(args.div_cert_cap if args.w_div > 0
+                                  else None))
     ev = ChainEvaluator(n, d1, d2, seed=args.seed,
-                        m_target=args.max_mult)
+                        m_target=args.max_mult, w_div=args.w_div)
     ranker = None
     if args.surrogate:
         from surrogate import SurrogateRanker

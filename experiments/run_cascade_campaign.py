@@ -96,10 +96,16 @@ def main():
     ap.add_argument("--coord-range", type=int, default=1)
     ap.add_argument("--max-mult", type=int, default=None)
     ap.add_argument("--surrogate", default=None)
+    ap.add_argument("--w-div", type=float, default=0.0)
+    ap.add_argument("--div-cert-cap", type=int, default=25)
+    ap.add_argument("--seeds-dir", nargs="+", default=None)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
+    if args.seeds_dir:
+        import run_swap_campaign as _rsc
+        _rsc.SEEDS_DIRS[:] = list(args.seeds_dir)
     K = QuadraticField(args.field_d)
     rng = np.random.default_rng(args.seed * 900001 + args.start_n * 31
                                 + args.field_d)
@@ -140,9 +146,11 @@ def main():
                     print(f"[{run_tag}] level {n}: {e}", flush=True)
                     break
         io = CampaignIO(cell_dir, n, d1, d2, f"cascade-{args.engine}",
-                        args.seed)
+                        args.seed,
+                        div_cert_cap=(args.div_cert_cap if args.w_div > 0
+                                      else None))
         ev = ChainEvaluator(n, d1, d2, seed=args.seed,
-                            m_target=args.max_mult)
+                            m_target=args.max_mult, w_div=args.w_div)
         slice_end = min(deadline, time.time() + args.slice_minutes * 60)
         print(f"[{run_tag}] level n={n} cell ({n},{d1},{d2}): "
               f"{len(seeds)} seeds, slice "

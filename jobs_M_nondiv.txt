@@ -1,0 +1,14 @@
+cell 15 7 7 me 30 qq
+cell 15 7 7 anneal 31 qq
+cell 15 7 7 me 32 qq
+cell 17 8 8 me 30 qq
+cell 17 8 8 anneal 31 qq
+cell 17 8 8 me 32 qq
+cell 27 13 13 me 30 qq
+cell 27 13 13 anneal 31 qq
+cell 27 13 13 me 32 qq
+cell 27 13 13 greedy 33 qq
+cell 18 7 10 me 30 -3
+cell 16 7 8 me 30 qq
+cell 19 9 9 me 30 qq
+cell 25 12 12 me 30 qq

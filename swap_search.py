@@ -59,7 +59,7 @@ from penalized_saito import PenalizedSaitoEvaluator, cached_penalized_loss
 from saito import construct_supersolvable, predicted_delta_b2
 from novelty import (lattice_wl_hash, is_essential, coordinate_height,
                      canonical_lineset_key, arrangement_from_record,
-                     iter_corpus_records)
+                     iter_corpus_records, n_divisional_lines)
 
 __all__ = [
     "SwapState", "ChainEvaluator",
@@ -282,7 +282,7 @@ class ChainEvaluator:
 
     def __init__(self, n, d1, d2, w_b2=0.05, seed=0,
                  refine_restarts=8, refine_iters=80,
-                 m_target=None, w_m=0.1):
+                 m_target=None, w_m=0.1, w_div=0.0):
         self.n, self.d1, self.d2 = n, d1, d2
         self.b2_star = (n - 1) + d1 * d2
         self.w_b2 = w_b2
@@ -290,6 +290,11 @@ class ChainEvaluator:
         # (logged separately; never part of the certification gate)
         self.m_target = m_target
         self.w_m = w_m
+        # optional Terao-directed pull AWAY from divisionally free lattices
+        # (Abe: a line with |A^H| - 1 in {d1, d2} makes freeness
+        # combinatorial).  Penalty = w_div * (#such lines) / n; off by
+        # default, logged separately, never part of the certification gate.
+        self.w_div = float(w_div)
         self.seed = seed
         self.refine_restarts = refine_restarts
         self.refine_iters = refine_iters
@@ -333,6 +338,9 @@ class ChainEvaluator:
         e = loss + self.w_b2 * b2_gap
         if self.m_target is not None:
             e += self.w_m * max(0, arr.max_multiplicity() - self.m_target)
+        if self.w_div > 0:
+            e += self.w_div * n_divisional_lines(arr, self.d1, self.d2) \
+                / self.n
         return e
 
     def energy_components(self, arr, loss) -> dict:
@@ -343,16 +351,26 @@ class ChainEvaluator:
         b2_pen = abs(arr.b2() - self.b2_star) / max(1, self.b2_star)
         m_pen = (max(0, arr.max_multiplicity() - self.m_target)
                  if self.m_target is not None else 0)
-        return {"raw_saito_loss": float(loss),
-                "b2_shell_penalty": float(b2_pen),
-                "b2_shell_weight": float(self.w_b2),
-                "m_target_penalty": float(m_pen),
-                "m_target_weight": float(self.w_m if self.m_target
-                                         is not None else 0.0),
-                "total_energy": float(loss + self.w_b2 * b2_pen
-                                      + (self.w_m * m_pen
-                                         if self.m_target is not None
-                                         else 0.0))}
+        comps = {"raw_saito_loss": float(loss),
+                 "b2_shell_penalty": float(b2_pen),
+                 "b2_shell_weight": float(self.w_b2),
+                 "m_target_penalty": float(m_pen),
+                 "m_target_weight": float(self.w_m if self.m_target
+                                          is not None else 0.0),
+                 "total_energy": float(loss + self.w_b2 * b2_pen
+                                       + (self.w_m * m_pen
+                                          if self.m_target is not None
+                                          else 0.0))}
+        if self.w_div > 0:
+            # keys appear ONLY in non-divisional-directed campaigns, so
+            # default-campaign records stay byte-identical
+            n_div = n_divisional_lines(arr, self.d1, self.d2)
+            comps["divisional_lines"] = int(n_div)
+            comps["divisional_weight"] = self.w_div
+            comps["divisional_penalty"] = float(n_div) / self.n
+            comps["total_energy"] = float(comps["total_energy"]
+                                          + self.w_div * n_div / self.n)
+        return comps
 
     def stats(self):
         return {"screen_evals": self.n_screen, "refine_evals": self.n_refine,
@@ -475,16 +493,25 @@ def random_walk(state, d1, d2, evaluator, rng, steps=500,
     return best[0], best[1], []
 
 
-def descriptor(arr, n):
+def descriptor(arr, n, pair=None):
     """MAP-Elites behavior descriptor: (m_max clamped to [3, n-2],
     #points of multiplicity >= 3 binned by 2, sign of b2 drift is handled by
     the energy, so the third slot is the count of >= 4-fold points binned
-    by 2).  Coarse on purpose: descriptor cells hold lattice reservoirs."""
+    by 2).  Coarse on purpose: descriptor cells hold lattice reservoirs.
+
+    With `pair=(d1, d2)` (non-divisional-directed campaigns only) a fourth
+    slot is appended: 1 if NO line has |A^H| - 1 in {d1, d2} (the lattice
+    is not divisionally free via a line), else 0 — so non-divisional
+    elites get their own archive cells and are never evicted by the
+    divisional majority."""
     mults = arr.multiplicities()
     m_max = max(3, min(arr.max_multiplicity(), n - 2))
     t3p = sum(1 for m in mults if m >= 3)
     t4p = sum(1 for m in mults if m >= 4)
-    return (m_max, t3p // 2, t4p // 2)
+    if pair is None:
+        return (m_max, t3p // 2, t4p // 2)
+    nondiv = int(n_divisional_lines(arr, pair[0], pair[1]) == 0)
+    return (m_max, t3p // 2, t4p // 2, nondiv)
 
 
 def map_elites(seeds, d1, d2, evaluator, rng, generations=3000,
@@ -508,18 +535,25 @@ def map_elites(seeds, d1, d2, evaluator, rng, generations=3000,
     n = len(seeds[0])
     archive = {} if archive is None else archive
     best = (None, 1.0)
+    # non-divisional-directed campaign (evaluator.w_div > 0): descriptor
+    # gains the non-divisional bit and elites prefer non-divisional
+    # lattices inside a loss-magnitude bucket.  Off: unchanged.
+    use_div = getattr(evaluator, "w_div", 0.0) > 0
 
     def elite_sort_key(e):
         # certified first; then loss ORDER OF MAGNITUDE; within a magnitude
         # bucket prefer NON-supersolvable elites (novelty pressure); then
         # exact loss, height, canonical key (total order, deterministic)
         bucket = int(log10(max(e["loss"], 1e-16)))
+        if use_div:
+            return (not e["certified"], bucket, e.get("div", True),
+                    e.get("ss", True), e["loss"], e["height"], e["key"])
         return (not e["certified"], bucket, e.get("ss", True), e["loss"],
                 e["height"], e["key"])
 
     def add_to_archive(arr, loss, certified=False):
         nonlocal best
-        d = str(descriptor(arr, n))
+        d = str(descriptor(arr, n, pair=(d1, d2) if use_div else None))
         K_arr = arr.coefficient_field()
         rec = {
             "lines": [str(l) for l in arr.lines],
@@ -533,6 +567,8 @@ def map_elites(seeds, d1, d2, evaluator, rng, generations=3000,
             "ss": bool(is_supersolvable_rank3(arr)),
             "descriptor": d,
         }
+        if use_div:
+            rec["div"] = bool(n_divisional_lines(arr, d1, d2) > 0)
         cell = archive.setdefault(d, [])
         same_lat = [e for e in cell if e["lattice_hash"] == rec["lattice_hash"]]
         if same_lat:
